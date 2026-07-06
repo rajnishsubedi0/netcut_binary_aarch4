@@ -18,7 +18,7 @@ rustup target add x86_64-linux-android
     
 ### Environment Variables
 
-Export following environment variable on terminal.
+Export following environment variable on terminal. Android studio NDK is used as environment variable so dont need to download other files.
 
 
 ```bash
