@@ -1,7 +1,7 @@
 [package]
-name = "netcut_project"
-version = "0.2.0"
-edition = "2021"
+name = "new_net_cut"
+version = "0.1.0"
+edition = "2024"
 
 [dependencies]
 libc = "0.2"
@@ -11,6 +11,7 @@ clap = { version = "4.5", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
+signal-hook = "0.3"
 
 [profile.release]
 lto = true
