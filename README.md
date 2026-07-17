@@ -43,9 +43,25 @@ Output executable binary will be on `./target/aarch64-linux-android/release` fol
 
 
 ### Runing the binary, needs root.
+### For main.rs binary. It only supports one device
 
 ```
 ./netcut -i wlan0 --target 192.168.18.53 --gateway 192.168.18.1
 ```
 
 ```-i``` flag is interface of the network. Type ```ifconfig``` or ```iwconfig``` on terminal to get network interface. ```--gateway``` flag is gateway of the router ```(Admin gateway)```).  ```--target``` flag is ip address of targeted user. To target multiple client we can use ```--target 192.168.18.54,192.168.18.152,192.168.18.78```.
+
+
+### For main2.rs binary. It only supports multiple devices built into the binary.
+
+```bash
+./netcut wlan0 192.168.18.1
+```
+After running this command the binary expects below commands.
+```add <ip>``` To add the new device.
+```remove <ip>``` To remove added device and restore the internet.
+```list``` Show all the targeted devices.
+```status``` Show service status and target count
+```quit``` / ```exit``` To stop the service and restore the internet.
+
+
