@@ -58,10 +58,16 @@ Output executable binary will be on `./target/aarch64-linux-android/release` fol
 ./netcut wlan0 192.168.18.1
 ```
 After running this command the binary expects below commands.
+
 ```add <ip>``` To add the new device.
+
 ```remove <ip>``` To remove added device and restore the internet.
+
 ```list``` Show all the targeted devices.
+
 ```status``` Show service status and target count
+
 ```quit``` / ```exit``` To stop the service and restore the internet.
+
 
 
