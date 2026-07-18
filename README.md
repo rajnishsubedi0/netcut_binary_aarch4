@@ -69,5 +69,13 @@ After running this command the binary expects below commands.
 
 ```quit``` / ```exit``` To stop the service and restore the internet.
 
+### For main.c binary. It supports only one device.
+
+Set environment variabls like above and run below command to compile.
+
+```bash
+$TOOLCHAIN/bin/aarch64-linux-android33-clang -static -o output main.
+```
+
 
 
