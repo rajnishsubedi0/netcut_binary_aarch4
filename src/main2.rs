@@ -31,7 +31,7 @@ struct Args {
     #[arg(value_name = "TARGET_IP")]
     initial_targets: Vec<Ipv4Addr>,
 
-    /// Packets-per-second rate (increased default to 10 to overpower ARP cache defenses)
+    /// Packets-per-second rate
     #[arg(long, default_value_t = 10)]
     rate: u64,
 
@@ -133,6 +133,30 @@ fn build_arp_reply(
         oper: 2u16.to_be(),
         sha: src_mac,
         spa: spoofed_ip.octets(),
+        tha: dst_mac,
+        tpa: target_ip.octets(),
+    }
+}
+
+// NEW: Restoration-specific ARP builder that prevents Wi-Fi driver disconnects
+fn build_arp_reply_restore(
+    tx_mac: [u8; 6],         // MUST be host's MAC for Wi-Fi driver compliance
+    dst_mac: [u8; 6],        // Destination MAC (target or gateway)
+    real_sender_mac: [u8; 6], // The actual MAC of the sender (goes in ARP payload)
+    sender_ip: Ipv4Addr,     // The actual IP of the sender
+    target_ip: Ipv4Addr,     // The IP we are updating in the target's cache
+) -> ArpFrame {
+    ArpFrame {
+        eth_dst: dst_mac,
+        eth_src: tx_mac, // Host's MAC (prevents Wi-Fi firmware anomaly drops)
+        eth_type: 0x0806u16.to_be(),
+        htype: 1u16.to_be(),
+        ptype: 0x0800u16.to_be(),
+        hlen: 6,
+        plen: 4,
+        oper: 2u16.to_be(),
+        sha: real_sender_mac, // Real MAC (updates remote cache correctly)
+        spa: sender_ip.octets(),
         tha: dst_mac,
         tpa: target_ip.octets(),
     }
@@ -410,78 +434,23 @@ struct TargetInfo {
     mac: [u8; 6],
 }
 
-// -------- ARP Cache Management (Cross-platform) --------
+// -------- ARP Cache Management (Optimized & Safe) --------
 
-#[cfg(target_os = "linux")]
-fn flush_arp_cache(iface: &str, ip: Ipv4Addr) {
-    // Try multiple methods to ensure the cache is cleared
-    let ip_str = ip.to_string();
-    
-    // Method 1: ip neigh flush (most reliable)
-    let _ = std::process::Command::new("ip")
-        .args(["neigh", "flush", "dev", iface])
-        .output();
-    
-    // Method 2: ip neigh del specific entry
-    let _ = std::process::Command::new("ip")
-        .args(["neigh", "del", &ip_str, "dev", iface])
-        .output();
-    
-    // Method 3: arp -d (fallback)
-    let _ = std::process::Command::new("arp")
-        .args(["-d", &ip_str])
-        .output();
-}
-
-#[cfg(target_os = "android")]
-fn flush_arp_cache(iface: &str, ip: Ipv4Addr) {
-    let ip_str = ip.to_string();
-    
-    // Android uses ip command
-    let _ = std::process::Command::new("ip")
-        .args(["neigh", "flush", "dev", iface])
-        .output();
-    
-    let _ = std::process::Command::new("ip")
-        .args(["neigh", "del", &ip_str, "dev", iface])
-        .output();
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn flush_arp_cache(_iface: &str, _ip: Ipv4Addr) {
-    // No-op on other platforms
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn force_arp_entry(iface: &str, ip: Ipv4Addr, mac: [u8; 6]) {
     let ip_str = ip.to_string();
     let mac_str = format_mac(&mac);
     
-    // Use 'ip neigh replace' with 'permanent' state for immediate effect
+    // We intentionally DO NOT flush the whole interface. 
+    // Flushing the gateway causes Android's ConnectivityService to panic and reconnect Wi-Fi.
+    // We only update the specific target entries to keep the host's gateway connection intact.
     let _ = std::process::Command::new("ip")
         .args([
             "neigh", "replace", 
             &ip_str, 
             "lladdr", &mac_str, 
             "dev", iface, 
-            "nud", "permanent"
-        ])
-        .output();
-}
-
-#[cfg(target_os = "android")]
-fn force_arp_entry(iface: &str, ip: Ipv4Addr, mac: [u8; 6]) {
-    let ip_str = ip.to_string();
-    let mac_str = format_mac(&mac);
-    
-    // Android: use ip neigh replace
-    let _ = std::process::Command::new("ip")
-        .args([
-            "neigh", "replace", 
-            &ip_str, 
-            "lladdr", &mac_str, 
-            "dev", iface, 
-            "nud", "permanent"
+            "nud", "reachable"
         ])
         .output();
 }
@@ -491,7 +460,7 @@ fn force_arp_entry(_iface: &str, _ip: Ipv4Addr, _mac: [u8; 6]) {
     // No-op on other platforms
 }
 
-// -------- Aggressive restore function (Instant Layer 2 + Cache Fix) --------
+// -------- Aggressive restore function (Wi-Fi Safe) --------
 
 fn aggressive_restore(
     sock: &RawSock,
@@ -501,75 +470,55 @@ fn aggressive_restore(
     gateway_mac: [u8; 6],
     iface: &str,
     our_mac: [u8; 6],
+    our_ip: Ipv4Addr,
 ) {
     eprintln!("[*] Starting instantaneous ARP restoration...");
     
-    // ========== PHASE 0: Invalidate ARP cache FIRST ==========
-    // This is the critical step that was missing!
-    // Modern kernels ignore ARP replies if the cache already has an entry
-    eprintln!("[*] Flushing ARP cache entries...");
-    
-    // Flush gateway
-    flush_arp_cache(iface, gateway_ip);
-    
-    // Flush all targets
-    for (ip, _) in targets {
-        flush_arp_cache(iface, *ip);
-    }
-    
-    // Small delay to let kernel process the flush
-    thread::sleep(Duration::from_millis(10));
-    
-    // ========== PHASE 1: Force correct ARP entries ==========
-    // Use 'ip neigh replace' to force entries into the cache
-    eprintln!("[*] Forcing correct ARP entries...");
-    
-    // Force gateway entry
-    force_arp_entry(iface, gateway_ip, gateway_mac);
-    
-    // Force all target entries
+    // ========== PHASE 1: Restore local host ARP entries (Safe) ==========
+    eprintln!("[*] Restoring local host ARP entries...");
     for (ip, mac) in targets {
         force_arp_entry(iface, *ip, *mac);
     }
     
-    // ========== PHASE 2: Flood with correct ARP replies ==========
-    // Send multiple packets to ensure all devices receive the update
-    eprintln!("[*] Flooding network with correct ARP entries...");
+    // ========== PHASE 2: Flood with correct ARP replies to TARGETS ==========
+    eprintln!("[*] Sending corrective ARP replies to targets...");
     
     for (ip, mac) in targets {
-        // Restore target: tell target that gateway is at its real MAC
-        let restore_target = build_arp_reply(gateway_mac, *mac, gateway_ip, *ip);
+        // 1. Tell target: "The gateway IP is at the gateway's real MAC"
+        // We transmit using our MAC (to satisfy Wi-Fi driver), but payload has gateway's real MAC.
+        let restore_target = build_arp_reply_restore(
+            our_mac,         // tx_mac (must be host's MAC for Wi-Fi)
+            *mac,            // dst_mac (target)
+            gateway_mac,     // real_sender_mac (gateway)
+            gateway_ip,      // sender_ip (gateway)
+            *ip,             // target_ip (target)
+        );
         
-        // Restore gateway: tell gateway that target is at its real MAC
-        let restore_gateway = build_arp_reply(*mac, gateway_mac, *ip, gateway_ip);
+        // 2. Tell gateway: "The target IP is at the target's real MAC"
+        let restore_gateway = build_arp_reply_restore(
+            our_mac,         // tx_mac (must be host's MAC for Wi-Fi)
+            gateway_mac,     // dst_mac (gateway)
+            *mac,            // real_sender_mac (target)
+            *ip,             // sender_ip (target)
+            gateway_ip,      // target_ip (gateway)
+        );
         
-        // Send many packets rapidly (no sleep for maximum speed)
-        for _ in 0..50 {
+        // Send packets (reduced from 50 to 10 to prevent Wi-Fi driver rate-limiting/anomaly drops)
+        for _ in 0..10 {
             let _ = sock.send_frame(restore_target.as_bytes(), ifindex);
             let _ = sock.send_frame(restore_gateway.as_bytes(), ifindex);
         }
     }
     
-    // ========== PHASE 3: Gratuitous ARP flood ==========
-    // Send gratuitous ARPs to reinforce the correct entries
-    eprintln!("[*] Sending gratuitous ARP announcements...");
+    // ========== PHASE 3: Gratuitous ARP for OURSELF ==========
+    eprintln!("[*] Sending gratuitous ARP for host...");
     
-    let gratuitous_gateway = build_gratuitous_arp(gateway_mac, gateway_ip);
-    let gratuitous_self = build_gratuitous_arp(our_mac, gateway_ip);
+    // Only announce our OWN correct MAC and IP. 
+    // Do NOT announce the gateway's IP, as that causes MAC mismatch warnings on Wi-Fi.
+    let gratuitous_ourself = build_gratuitous_arp(our_mac, our_ip);
     
-    // Send many gratuitous ARPs
-    for _ in 0..100 {
-        let _ = sock.send_frame(gratuitous_gateway.as_bytes(), ifindex);
-        let _ = sock.send_frame(gratuitous_self.as_bytes(), ifindex);
-    }
-    
-    // ========== PHASE 4: Verify and re-force if needed ==========
-    eprintln!("[*] Verifying and reinforcing ARP entries...");
-    
-    // Re-force entries one more time to ensure they stick
-    force_arp_entry(iface, gateway_ip, gateway_mac);
-    for (ip, mac) in targets {
-        force_arp_entry(iface, *ip, *mac);
+    for _ in 0..5 {
+        let _ = sock.send_frame(gratuitous_ourself.as_bytes(), ifindex);
     }
     
     eprintln!("[+] Instantaneous restoration complete. Internet should be restored immediately.");
@@ -764,7 +713,6 @@ fn main() -> Result<()> {
                         if let Some(info) = info {
                             eprintln!("[*] Removing {} and restoring ARP...", ip);
                             
-                            // Restore only this specific target
                             if let Ok(temp_sock) = RawSock::new(ETH_P_ARP as u16) {
                                 aggressive_restore(
                                     &temp_sock,
@@ -774,6 +722,7 @@ fn main() -> Result<()> {
                                     gateway_mac_clone,
                                     &iface_clone,
                                     src_mac_clone,
+                                    src_ip_clone,
                                 );
                             } else {
                                 eprintln!("[!] Failed to create temporary socket for restoration.");
@@ -862,6 +811,7 @@ fn main() -> Result<()> {
             gateway_mac,
             &args.iface,
             src_mac,
+            src_ip,
         );
     }
 
