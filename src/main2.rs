@@ -410,30 +410,85 @@ struct TargetInfo {
     mac: [u8; 6],
 }
 
-// -------- Targeted ARP Cache Fix (Instant & Non-Disruptive) --------
+// -------- ARP Cache Management (Cross-platform) --------
 
-#[cfg(target_os = "android")]
-fn fix_local_arp_cache(iface: &str, ip: Ipv4Addr, mac: [u8; 6]) {
-    use std::process::Command;
-    let mac_str = format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    );
+#[cfg(target_os = "linux")]
+fn flush_arp_cache(iface: &str, ip: Ipv4Addr) {
+    // Try multiple methods to ensure the cache is cleared
     let ip_str = ip.to_string();
     
-    // Forcefully replace the specific ARP cache entry.
-    // 'nud reachable' ensures the kernel uses it immediately without probing.
-    // This is instantaneous and does NOT drop the Wi-Fi connection.
-    let _ = Command::new("ip")
+    // Method 1: ip neigh flush (most reliable)
+    let _ = std::process::Command::new("ip")
+        .args(["neigh", "flush", "dev", iface])
+        .output();
+    
+    // Method 2: ip neigh del specific entry
+    let _ = std::process::Command::new("ip")
+        .args(["neigh", "del", &ip_str, "dev", iface])
+        .output();
+    
+    // Method 3: arp -d (fallback)
+    let _ = std::process::Command::new("arp")
+        .args(["-d", &ip_str])
+        .output();
+}
+
+#[cfg(target_os = "android")]
+fn flush_arp_cache(iface: &str, ip: Ipv4Addr) {
+    let ip_str = ip.to_string();
+    
+    // Android uses ip command
+    let _ = std::process::Command::new("ip")
+        .args(["neigh", "flush", "dev", iface])
+        .output();
+    
+    let _ = std::process::Command::new("ip")
+        .args(["neigh", "del", &ip_str, "dev", iface])
+        .output();
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn flush_arp_cache(_iface: &str, _ip: Ipv4Addr) {
+    // No-op on other platforms
+}
+
+#[cfg(target_os = "linux")]
+fn force_arp_entry(iface: &str, ip: Ipv4Addr, mac: [u8; 6]) {
+    let ip_str = ip.to_string();
+    let mac_str = format_mac(&mac);
+    
+    // Use 'ip neigh replace' with 'permanent' state for immediate effect
+    let _ = std::process::Command::new("ip")
         .args([
-            "neigh", "replace", &ip_str, "lladdr", &mac_str, "dev", iface, "nud", "reachable",
+            "neigh", "replace", 
+            &ip_str, 
+            "lladdr", &mac_str, 
+            "dev", iface, 
+            "nud", "permanent"
         ])
         .output();
 }
 
-#[cfg(not(target_os = "android"))]
-fn fix_local_arp_cache(_iface: &str, _ip: Ipv4Addr, _mac: [u8; 6]) {
-    // No-op on non-Android, Layer 2 packets will have to do the work
+#[cfg(target_os = "android")]
+fn force_arp_entry(iface: &str, ip: Ipv4Addr, mac: [u8; 6]) {
+    let ip_str = ip.to_string();
+    let mac_str = format_mac(&mac);
+    
+    // Android: use ip neigh replace
+    let _ = std::process::Command::new("ip")
+        .args([
+            "neigh", "replace", 
+            &ip_str, 
+            "lladdr", &mac_str, 
+            "dev", iface, 
+            "nud", "permanent"
+        ])
+        .output();
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn force_arp_entry(_iface: &str, _ip: Ipv4Addr, _mac: [u8; 6]) {
+    // No-op on other platforms
 }
 
 // -------- Aggressive restore function (Instant Layer 2 + Cache Fix) --------
@@ -445,38 +500,76 @@ fn aggressive_restore(
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
     iface: &str,
-    _our_mac: [u8; 6],
+    our_mac: [u8; 6],
 ) {
     eprintln!("[*] Starting instantaneous ARP restoration...");
     
-    // Phase 0: Instantly fix the LOCAL device's ARP cache (bypasses kernel ignore rules)
-    // Modern Linux/Android kernels ignore unsolicited ARP replies for security.
-    // 'ip neigh replace' forcefully injects the correct mapping without dropping the connection.
-    #[cfg(target_os = "android")]
-    {
-        fix_local_arp_cache(iface, gateway_ip, gateway_mac);
-        for (ip, mac) in targets {
-            fix_local_arp_cache(iface, *ip, *mac);
-        }
+    // ========== PHASE 0: Invalidate ARP cache FIRST ==========
+    // This is the critical step that was missing!
+    // Modern kernels ignore ARP replies if the cache already has an entry
+    eprintln!("[*] Flushing ARP cache entries...");
+    
+    // Flush gateway
+    flush_arp_cache(iface, gateway_ip);
+    
+    // Flush all targets
+    for (ip, _) in targets {
+        flush_arp_cache(iface, *ip);
     }
     
-    // Phase 1: Flood both directions with correct ARP entries to fix Router and Targets
+    // Small delay to let kernel process the flush
+    thread::sleep(Duration::from_millis(10));
+    
+    // ========== PHASE 1: Force correct ARP entries ==========
+    // Use 'ip neigh replace' to force entries into the cache
+    eprintln!("[*] Forcing correct ARP entries...");
+    
+    // Force gateway entry
+    force_arp_entry(iface, gateway_ip, gateway_mac);
+    
+    // Force all target entries
     for (ip, mac) in targets {
+        force_arp_entry(iface, *ip, *mac);
+    }
+    
+    // ========== PHASE 2: Flood with correct ARP replies ==========
+    // Send multiple packets to ensure all devices receive the update
+    eprintln!("[*] Flooding network with correct ARP entries...");
+    
+    for (ip, mac) in targets {
+        // Restore target: tell target that gateway is at its real MAC
         let restore_target = build_arp_reply(gateway_mac, *mac, gateway_ip, *ip);
+        
+        // Restore gateway: tell gateway that target is at its real MAC
         let restore_gateway = build_arp_reply(*mac, gateway_mac, *ip, gateway_ip);
         
-        for _ in 0..15 {
+        // Send many packets rapidly (no sleep for maximum speed)
+        for _ in 0..50 {
             let _ = sock.send_frame(restore_target.as_bytes(), ifindex);
             let _ = sock.send_frame(restore_gateway.as_bytes(), ifindex);
-            thread::sleep(Duration::from_micros(500)); // 0.5ms rapid fire
         }
     }
     
-    // Phase 2: Send gratuitous ARPs from gateway to reinforce the fix on the network
+    // ========== PHASE 3: Gratuitous ARP flood ==========
+    // Send gratuitous ARPs to reinforce the correct entries
+    eprintln!("[*] Sending gratuitous ARP announcements...");
+    
     let gratuitous_gateway = build_gratuitous_arp(gateway_mac, gateway_ip);
-    for _ in 0..30 {
+    let gratuitous_self = build_gratuitous_arp(our_mac, gateway_ip);
+    
+    // Send many gratuitous ARPs
+    for _ in 0..100 {
         let _ = sock.send_frame(gratuitous_gateway.as_bytes(), ifindex);
-        thread::sleep(Duration::from_micros(500));
+        let _ = sock.send_frame(gratuitous_self.as_bytes(), ifindex);
+    }
+    
+    // ========== PHASE 4: Verify and re-force if needed ==========
+    eprintln!("[*] Verifying and reinforcing ARP entries...");
+    
+    // Re-force entries one more time to ensure they stick
+    force_arp_entry(iface, gateway_ip, gateway_mac);
+    for (ip, mac) in targets {
+        force_arp_entry(iface, *ip, *mac);
     }
     
     eprintln!("[+] Instantaneous restoration complete. Internet should be restored immediately.");
@@ -671,7 +764,7 @@ fn main() -> Result<()> {
                         if let Some(info) = info {
                             eprintln!("[*] Removing {} and restoring ARP...", ip);
                             
-                            // Restore only this specific target safely using instantaneous cache fix + Layer 2
+                            // Restore only this specific target
                             if let Ok(temp_sock) = RawSock::new(ETH_P_ARP as u16) {
                                 aggressive_restore(
                                     &temp_sock,
