@@ -1043,6 +1043,7 @@ enum JsonCommand {
     Ban { ip: String },
     Unban { ip: String },
     BanAll,
+    UnbanAll,
     Save,
     Load,
     Quit,
@@ -1610,6 +1611,52 @@ fn main() -> Result<()> {
                             );
                         } else {
                             println!("117|BAN_ALL_COMPLETE|N/A|Banned {} devices", ban_count);
+                        }
+                    }
+                    JsonCommand::UnbanAll => {
+                        let mut t = targets_clone.lock().unwrap();
+                        let mut b = bans_clone.lock().unwrap();
+                        let mut unbanned_ips = Vec::new();
+
+                        // Collect all banned IPs
+                        for ip in b.iter() {
+                            unbanned_ips.push(*ip);
+                        }
+
+                        // Clear the ban list
+                        b.clear();
+
+                        // Remove them from active targets and prepare for restoration
+                        let targets_to_restore: Vec<(Ipv4Addr, [u8; 6])> = unbanned_ips
+                            .iter()
+                            .filter_map(|ip| t.remove(ip).map(|info| (*ip, info.mac)))
+                            .collect();
+
+                        if !targets_to_restore.is_empty() {
+                            if let Ok(temp_sock) = RawSock::new(ETH_P_ARP as u16) {
+                                aggressive_restore(
+                                    &temp_sock,
+                                    ifindex_clone,
+                                    &targets_to_restore,
+                                    gateway_clone,
+                                    gateway_mac_clone,
+                                    &iface_clone,
+                                    src_mac_clone,
+                                    src_ip_clone,
+                                );
+                            }
+                        }
+
+                        if json_mode_clone {
+                            println!(
+                                r#"{{"code":118,"status":"UNBAN_ALL_COMPLETE","ip":"N/A","message":"Unbanned {} devices"}}"#,
+                                unbanned_ips.len()
+                            );
+                        } else {
+                            println!(
+                                "118|UNBAN_ALL_COMPLETE|N/A|Unbanned {} devices",
+                                unbanned_ips.len()
+                            );
                         }
                     }
                     JsonCommand::Flush => {
