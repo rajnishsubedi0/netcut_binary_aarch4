@@ -17,7 +17,7 @@ use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 // -------- Exit Codes --------
 #[repr(i32)]
@@ -122,10 +122,6 @@ struct Args {
     #[arg(long)]
     log_file: Option<String>,
 
-    /// Persistence file path for targets
-    #[arg(long, default_value = "/tmp/netcut_targets.json")]
-    persist_file: String,
-
     /// Enable REST API server
     #[arg(long, default_value_t = false)]
     rest_api: bool,
@@ -141,25 +137,8 @@ struct Args {
     /// Scan range (CIDR notation, e.g., 192.168.1.0/24)
     #[arg(long)]
     scan_range: Option<String>,
-}
-
-// -------- Data Structures for Persistence --------
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct TargetEntry {
-    ip: String,
-    mac: String,
-    added_at: u64,
-    last_seen: u64,
-    packets_sent: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistenceData {
-    version: u32,
-    targets: Vec<TargetEntry>,
-    bans: Vec<String>,
-    created_at: u64,
-    updated_at: u64,
+    
+    // REMOVED: persist_file argument. Persistence is now fully managed by the Android app.
 }
 
 // -------- Statistics --------
@@ -605,20 +584,13 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(mac)
 }
 
-fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
 // -------- Network Scanner --------
 fn scan_network(
     iface: &str,
     src_mac: [u8; 6],
     src_ip: Ipv4Addr,
     ifindex: i32,
-    timeout: Duration, // Now properly used below
+    timeout: Duration,
     stop: &Arc<AtomicBool>,
 ) -> Result<Vec<Ipv4Addr>> {
     eprintln!("[*] Scanning network...");
@@ -730,7 +702,6 @@ fn aggressive_restore(
     eprintln!("[*] Sending corrective ARP replies to targets...");
     for (ip, mac) in targets {
         let restore_target = build_arp_reply_restore(our_mac, *mac, gateway_mac, gateway_ip, *ip);
-
         let restore_gateway = build_arp_reply_restore(our_mac, gateway_mac, *mac, *ip, gateway_ip);
 
         for _ in 0..10 {
@@ -748,99 +719,8 @@ fn aggressive_restore(
     eprintln!("[+] Instantaneous restoration complete.");
 }
 
-// -------- Persistence Functions --------
-fn save_targets(
-    targets: &HashMap<Ipv4Addr, TargetInfo>,
-    bans: &Vec<Ipv4Addr>,
-    filename: &str,
-) -> Result<()> {
-    let mut entries = Vec::new();
-    for (ip, info) in targets {
-        entries.push(TargetEntry {
-            ip: ip.to_string(),
-            mac: format_mac(&info.mac),
-            added_at: info.added_at.elapsed().as_secs(),
-            last_seen: current_timestamp(),
-            packets_sent: info.packets_sent,
-        });
-    }
-
-    let data = PersistenceData {
-        version: 1,
-        targets: entries,
-        bans: bans.iter().map(|ip| ip.to_string()).collect(),
-        created_at: current_timestamp(),
-        updated_at: current_timestamp(),
-    };
-
-    let json = serde_json::to_string_pretty(&data)?;
-    std::fs::write(filename, json)?;
-
-    eprintln!("[+] Targets saved to {}", filename);
-    Ok(())
-}
-
-fn load_targets(
-    filename: &str,
-    iface: &str,
-    src_mac: [u8; 6],
-    src_ip: Ipv4Addr,
-    ifindex: i32,
-    timeout: Duration,
-    stop: &Arc<AtomicBool>,
-) -> Result<(HashMap<Ipv4Addr, TargetInfo>, Vec<Ipv4Addr>)> {
-    if !std::path::Path::new(filename).exists() {
-        return Ok((HashMap::new(), Vec::new()));
-    }
-
-    let content = std::fs::read_to_string(filename)?;
-    let data: PersistenceData = serde_json::from_str(&content)?;
-
-    let mut targets = HashMap::new();
-    let mut bans = Vec::new();
-
-    for entry in data.targets {
-        if let Ok(ip) = entry.ip.parse::<Ipv4Addr>() {
-            if let Some(mac) = parse_mac(&entry.mac) {
-                targets.insert(
-                    ip,
-                    TargetInfo {
-                        ip,
-                        mac,
-                        added_at: Instant::now(),
-                        packets_sent: 0,
-                    },
-                );
-                eprintln!("[*] Loaded target {} with MAC {}", ip, entry.mac);
-            } else {
-                eprintln!("[*] Resolving MAC for loaded target {}...", ip);
-                if let Ok(mac) = resolve_mac(iface, src_mac, src_ip, ip, ifindex, timeout, stop) {
-                    targets.insert(
-                        ip,
-                        TargetInfo {
-                            ip,
-                            mac,
-                            added_at: Instant::now(),
-                            packets_sent: 0,
-                        },
-                    );
-                    eprintln!("[+] Loaded target {} ({})", ip, format_mac(&mac));
-                } else {
-                    eprintln!("[!] Failed to resolve MAC for loaded target {}", ip);
-                }
-            }
-        }
-    }
-
-    for ban_ip in data.bans {
-        if let Ok(ip) = ban_ip.parse::<Ipv4Addr>() {
-            bans.push(ip);
-        }
-    }
-
-    eprintln!("[+] Loaded {} targets from {}", targets.len(), filename);
-    Ok((targets, bans))
-}
+// REMOVED: save_targets and load_targets functions. 
+// Persistence is now fully managed by the Android app via SharedPreferences/SQLite.
 
 // -------- Output Helper Functions --------
 fn output_success(message: &str, ip: Option<Ipv4Addr>, json: bool) {
@@ -1079,7 +959,6 @@ fn handle_ban_all(
         (to_ban, macs)
     };
 
-    // FIX: Store length before `targets_to_ban` is moved by `into_iter()`
     let ban_count = targets_to_ban.len();
 
     if !targets_to_ban.is_empty() {
@@ -1187,6 +1066,8 @@ fn main() -> Result<()> {
 
     let running = Arc::new(AtomicBool::new(true));
     let stop = Arc::new(AtomicBool::new(false));
+    
+    // Bans list starts empty. The Android app will populate it by sending "ban" commands on startup.
     let bans: Arc<Mutex<Vec<Ipv4Addr>>> = Arc::new(Mutex::new(Vec::new()));
 
     {
@@ -1264,26 +1145,9 @@ fn main() -> Result<()> {
     };
     eprintln!("[+] Gateway MAC: {}", format_mac(&gateway_mac));
 
-    let initial_targets = match load_targets(
-        &args.persist_file,
-        &args.iface,
-        src_mac,
-        src_ip,
-        ifindex,
-        timeout,
-        &stop,
-    ) {
-        Ok((targets, bans_list)) => {
-            *bans.lock().unwrap() = bans_list;
-            targets
-        }
-        Err(e) => {
-            eprintln!("[!] Failed to load persisted targets: {}", e);
-            HashMap::new()
-        }
-    };
-
-    let targets: Arc<Mutex<HashMap<Ipv4Addr, TargetInfo>>> = Arc::new(Mutex::new(initial_targets));
+    // REMOVED: load_targets call. Targets and bans are now managed dynamically via commands from the host app.
+    let targets: Arc<Mutex<HashMap<Ipv4Addr, TargetInfo>>> = Arc::new(Mutex::new(HashMap::new()));
+    eprintln!("[*] Targets and bans will be managed dynamically via commands from the host app.");
 
     if args.scan_on_start {
         if let Some(scan_range) = args.scan_range {
@@ -1425,7 +1289,7 @@ fn main() -> Result<()> {
     let ifindex_clone = ifindex;
     let timeout_clone = timeout;
     let gateway_mac_clone = gateway_mac;
-    let persist_file_clone = args.persist_file.clone();
+    // REMOVED: persist_file_clone
     let stats_clone = Arc::clone(&stats);
     let json_mode_clone = json_mode;
 
@@ -1447,8 +1311,8 @@ fn main() -> Result<()> {
             eprintln!("  ban <ip>                    - Ban a device (permanent block)");
             eprintln!("  unban <ip>                  - Unban a device");
             eprintln!("  ban_all                     - Ban all current targets");
-            eprintln!("  save                        - Save targets to file");
-            eprintln!("  load                        - Load targets from file");
+            eprintln!("  save                        - No-op (Managed by Android app)");
+            eprintln!("  load                        - No-op (Managed by Android app)");
             eprintln!("  quit / exit                 - Stop service");
         } else {
             eprintln!(
@@ -1465,7 +1329,6 @@ fn main() -> Result<()> {
             input.clear();
             match stdin.read_line(&mut input) {
                 Ok(0) => {
-                    // FIFO writer closed. Sleep and retry to wait for next writer.
                     thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -1482,7 +1345,6 @@ fn main() -> Result<()> {
 
             let input_trimmed = input.trim();
 
-            // Attempt to parse as JSON command first
             if let Ok(json_cmd) = serde_json::from_str::<JsonCommand>(input_trimmed) {
                 match json_cmd {
                     JsonCommand::Add { ip } => {
@@ -1558,14 +1420,11 @@ fn main() -> Result<()> {
                             output_invalid_argument(&ip, json_mode_clone);
                         }
                     }
-                    // Replace your existing JsonCommand::Unban and JsonCommand::BanAll with these:
                     JsonCommand::Unban { ip } => {
                         if let Ok(ip_addr) = ip.parse::<Ipv4Addr>() {
                             let mut b = bans_clone.lock().unwrap();
                             if let Some(pos) = b.iter().position(|&x| x == ip_addr) {
                                 b.remove(pos);
-
-                                // Also remove from targets and aggressively restore to ensure internet comes back immediately
                                 if let Some(info) = targets_clone.lock().unwrap().remove(&ip_addr) {
                                     if let Ok(temp_sock) = RawSock::new(ETH_P_ARP as u16) {
                                         aggressive_restore(
@@ -1588,13 +1447,11 @@ fn main() -> Result<()> {
                             output_invalid_argument(&ip, json_mode_clone);
                         }
                     }
-
                     JsonCommand::BanAll => {
                         let ban_count = {
                             let mut t = targets_clone.lock().unwrap();
                             let mut b = bans_clone.lock().unwrap();
                             let mut count = 0;
-                            // Ban all current targets (they are already being poisoned, this makes it permanent)
                             for (ip, _) in t.iter() {
                                 if !b.contains(ip) {
                                     b.push(*ip);
@@ -1618,15 +1475,12 @@ fn main() -> Result<()> {
                         let mut b = bans_clone.lock().unwrap();
                         let mut unbanned_ips = Vec::new();
 
-                        // Collect all banned IPs
                         for ip in b.iter() {
                             unbanned_ips.push(*ip);
                         }
 
-                        // Clear the ban list
                         b.clear();
 
-                        // Remove them from active targets and prepare for restoration
                         let targets_to_restore: Vec<(Ipv4Addr, [u8; 6])> = unbanned_ips
                             .iter()
                             .filter_map(|ip| t.remove(ip).map(|info| (*ip, info.mac)))
@@ -1709,7 +1563,7 @@ fn main() -> Result<()> {
                                     info.packets_sent
                                 ));
                             }
-                            json.pop(); // Remove trailing comma
+                            json.pop();
                             json.push_str("]}");
                             println!("{}", json);
                         } else {
@@ -1833,47 +1687,19 @@ fn main() -> Result<()> {
                         }
                     }
                     JsonCommand::Save => {
-                        let t = targets_clone.lock().unwrap();
-                        let b = bans_clone.lock().unwrap();
-                        if let Err(e) = save_targets(&t, &b, &persist_file_clone) {
-                            output_internal_error(&e.to_string(), json_mode_clone);
-                        } else if json_mode_clone {
-                            println!(
-                                r#"{{"code":113,"status":"SAVE_COMPLETE","ip":"N/A","message":"Saved {} targets"}}"#,
-                                t.len()
-                            );
+                        // Persistence is now managed by the Android app via SharedPreferences/SQLite
+                        if json_mode_clone {
+                            println!(r#"{{"code":113,"status":"SAVE_COMPLETE","ip":"N/A","message":"Persistence managed by Android app"}}"#);
                         } else {
-                            println!("113|SAVE_COMPLETE|N/A|Saved {} targets", t.len());
+                            println!("113|SAVE_COMPLETE|N/A|Persistence managed by Android app");
                         }
                     }
                     JsonCommand::Load => {
-                        if let Ok((loaded_targets, loaded_bans)) = load_targets(
-                            &persist_file_clone,
-                            &iface_clone,
-                            src_mac_clone,
-                            src_ip_clone,
-                            ifindex_clone,
-                            timeout_clone,
-                            &stop_clone,
-                        ) {
-                            {
-                                let mut t = targets_clone.lock().unwrap();
-                                for (ip, info) in loaded_targets {
-                                    t.insert(ip, info);
-                                }
-                            }
-                            *bans_clone.lock().unwrap() = loaded_bans;
-                            let count = targets_clone.lock().unwrap().len();
-                            if json_mode_clone {
-                                println!(
-                                    r#"{{"code":114,"status":"LOAD_COMPLETE","ip":"N/A","message":"Loaded {} targets"}}"#,
-                                    count
-                                );
-                            } else {
-                                println!("114|LOAD_COMPLETE|N/A|Loaded {} targets", count);
-                            }
+                        // Persistence is now managed by the Android app via SharedPreferences/SQLite
+                        if json_mode_clone {
+                            println!(r#"{{"code":114,"status":"LOAD_COMPLETE","ip":"N/A","message":"Persistence managed by Android app"}}"#);
                         } else {
-                            output_internal_error("Failed to load targets", json_mode_clone);
+                            println!("114|LOAD_COMPLETE|N/A|Persistence managed by Android app");
                         }
                     }
                     JsonCommand::Quit => {
@@ -1884,12 +1710,10 @@ fn main() -> Result<()> {
                     }
                 }
             } else if json_mode_clone {
-                // Strict JSON mode: output JSON error for invalid input
                 println!(
                     r#"{{"code":106,"status":"INVALID_ARGUMENT","ip":"N/A","message":"Invalid JSON format. Expected a JSON command object."}}"#
                 );
             } else {
-                // Fallback to space-separated string commands for backward compatibility
                 let parts: Vec<&str> = input_trimmed.split_whitespace().collect();
                 if parts.is_empty() {
                     continue;
@@ -2185,47 +2009,17 @@ fn main() -> Result<()> {
                         }
                     }
                     "save" => {
-                        let t = targets_clone.lock().unwrap();
-                        let b = bans_clone.lock().unwrap();
-                        if let Err(e) = save_targets(&t, &b, &persist_file_clone) {
-                            output_internal_error(&e.to_string(), json_mode_clone);
-                        } else if json_mode_clone {
-                            println!(
-                                r#"{{"code":113,"status":"SAVE_COMPLETE","ip":"N/A","message":"Saved {} targets"}}"#,
-                                t.len()
-                            );
+                        if json_mode_clone {
+                            println!(r#"{{"code":113,"status":"SAVE_COMPLETE","ip":"N/A","message":"Persistence managed by Android app"}}"#);
                         } else {
-                            println!("113|SAVE_COMPLETE|N/A|Saved {} targets", t.len());
+                            println!("113|SAVE_COMPLETE|N/A|Persistence managed by Android app");
                         }
                     }
                     "load" => {
-                        if let Ok((loaded_targets, loaded_bans)) = load_targets(
-                            &persist_file_clone,
-                            &iface_clone,
-                            src_mac_clone,
-                            src_ip_clone,
-                            ifindex_clone,
-                            timeout_clone,
-                            &stop_clone,
-                        ) {
-                            {
-                                let mut t = targets_clone.lock().unwrap();
-                                for (ip, info) in loaded_targets {
-                                    t.insert(ip, info);
-                                }
-                            }
-                            *bans_clone.lock().unwrap() = loaded_bans;
-                            let count = targets_clone.lock().unwrap().len();
-                            if json_mode_clone {
-                                println!(
-                                    r#"{{"code":114,"status":"LOAD_COMPLETE","ip":"N/A","message":"Loaded {} targets"}}"#,
-                                    count
-                                );
-                            } else {
-                                println!("114|LOAD_COMPLETE|N/A|Loaded {} targets", count);
-                            }
+                        if json_mode_clone {
+                            println!(r#"{{"code":114,"status":"LOAD_COMPLETE","ip":"N/A","message":"Persistence managed by Android app"}}"#);
                         } else {
-                            output_internal_error("Failed to load targets", json_mode_clone);
+                            println!("114|LOAD_COMPLETE|N/A|Persistence managed by Android app");
                         }
                     }
                     "quit" | "exit" => {
@@ -2301,10 +2095,8 @@ fn main() -> Result<()> {
         );
     }
 
-    let t = targets.lock().unwrap();
-    let b = bans.lock().unwrap();
-    let _ = save_targets(&t, &b, &args.persist_file);
-
+    // REMOVED: save_targets call on exit. The Android app is responsible for persistence.
+    
     output_success("Service stopped", None, json_mode);
     eprintln!("[+] Restore complete. Exiting.");
     ExitCode::Success.exit(Some("SUCCESS|N/A|Service stopped successfully"));
