@@ -194,14 +194,15 @@ mod raw_socket {
 
     pub struct RawSock { pub fd: c_int }
 
-    impl RawSock {
+        impl RawSock {
         pub fn new(protocol: u16) -> Result<Self> {
             let proto = i32::from(protocol.to_be());
             let fd = unsafe { socket(AF_PACKET, SOCK_RAW, proto) };
             if fd < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EPERM) {
-                    return Err(anyhow!("Permission denied to create raw socket"));
+                    
+                    return Err(anyhow!("EPERM: SELinux blocked raw socket creation. Ensure 'magiskpolicy' rules are applied or process has CAP_NET_RAW."));
                 }
                 return Err(err).context("socket(AF_PACKET, SOCK_RAW)");
             }
@@ -214,12 +215,13 @@ mod raw_socket {
             if rc < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EPERM) {
-                    return Err(anyhow!("Permission denied to bind to device"));
+                    return Err(anyhow!("EPERM: SELinux blocked SO_BINDTODEVICE. Missing 'net_admin' or 'net_raw' capability in SELinux domain."));
                 }
                 return Err(err).context("SO_BINDTODEVICE");
             }
             Ok(())
         }
+       
 
         pub fn send_frame(&self, frame: &[u8], ifindex: i32) -> Result<()> {
             let mut sll: sockaddr_ll = unsafe { zeroed() };
