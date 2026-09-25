@@ -18,9 +18,6 @@ unsafe extern "C" {
     static mut c_stdout: *mut libc::FILE;
 }
 
-// ============================================================================
-// UTILITIES: Structured Logging
-// ============================================================================
 
 macro_rules! log_info {
     ($($arg:tt)*) => { eprintln!("[INFO] {}", format_args!($($arg)*)); };
@@ -29,10 +26,6 @@ macro_rules! log_info {
 macro_rules! log_error {
     ($($arg:tt)*) => { eprintln!("[ERROR] {}", format_args!($($arg)*)); };
 }
-
-// ============================================================================
-// MODULE: protocol
-// ============================================================================
 
 mod protocol {
     use super::*;
@@ -108,10 +101,6 @@ mod protocol {
     }
 }
 
-// ============================================================================
-// MODULE: arp
-// ============================================================================
-
 mod arp {
     use super::*;
 
@@ -161,10 +150,6 @@ mod arp {
         }
     }
 }
-
-// ============================================================================
-// MODULE: raw_socket
-// ============================================================================
 
 mod raw_socket {
     use super::*;
@@ -280,10 +265,6 @@ mod raw_socket {
     }
 }
 
-// ============================================================================
-// MODULE: engine
-// ============================================================================
-
 mod engine {
     use super::*;
     use crate::arp::{build_arp_reply_restore, build_arp_request, build_gratuitous_arp, ArpFrame};
@@ -374,10 +355,6 @@ mod engine {
     }
 }
 
-// ============================================================================
-// CLI
-// ============================================================================
-
 #[derive(Parser, Debug)]
 #[command(name = "netcut", about = "ARP spoofing execution engine")]
 struct Cli {
@@ -400,18 +377,11 @@ enum CliCommand {
     },
 }
 
-// ============================================================================
-// MAIN
-// ============================================================================
 
 fn main() -> Result<()> {
     unsafe {
         libc::setvbuf(c_stdout, std::ptr::null_mut(), libc::_IOLBF, 0);
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        
-        // ✅ CRITICAL FIX: If the parent process (Java App) dies (e.g. swiped from recents),
-        // the kernel will automatically send SIGTERM to this Rust binary.
-        // This guarantees we don't keep poisoning the network as an orphan process.
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
     }
 
